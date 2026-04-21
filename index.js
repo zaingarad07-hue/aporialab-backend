@@ -154,7 +154,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.1.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
+app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.2.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -374,6 +374,42 @@ app.put('/api/users/profile', authMiddleware, async (req, res) => {
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
     res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role } });
   } catch (error) {
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/users/:id', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const user = await User.findById(req.params.id).select('-password').lean();
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    
+    const discussions = await Discussion.find({ 'author._id': user._id })
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .lean();
+    
+    const discussionCount = await Discussion.countDocuments({ 'author._id': user._id });
+    
+    res.json({
+      success: true,
+      user: {
+        id: user._id.toString(),
+        _id: user._id.toString(),
+        name: user.name,
+        avatar: user.avatar,
+        bio: user.bio,
+        reputation: user.reputation,
+        role: user.role,
+        discussionCount,
+        createdAt: user.createdAt
+      },
+      discussions: discussions.map(d => Object.assign({}, d, { _id: d._id.toString() }))
+    });
+  } catch (error) {
+    console.error('Get user by id error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
