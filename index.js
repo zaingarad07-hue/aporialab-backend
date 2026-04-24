@@ -154,7 +154,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.3.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
+app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.4.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -433,6 +433,57 @@ app.get('/api/users/:id', async (req, res) => {
   } catch (error) {
     console.error('Get user by id error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/search', async (req, res) => {
+  try {
+    const q = (req.query.q || '').toString().trim();
+    
+    if (!q || q.length < 2) {
+      return res.json({ 
+        success: true, 
+        discussions: [], 
+        users: [],
+        message: 'اكتب حرفين على الأقل للبحث'
+      });
+    }
+    
+    const searchRegex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    
+    const [discussions, users] = await Promise.all([
+      Discussion.find({
+        $or: [
+          { title: searchRegex },
+          { content: searchRegex },
+          { tags: searchRegex }
+        ]
+      })
+        .sort({ views: -1, createdAt: -1 })
+        .limit(20)
+        .lean(),
+      
+      User.find({
+        $or: [
+          { name: searchRegex },
+          { bio: searchRegex }
+        ]
+      })
+        .select('name avatar bio reputation role')
+        .sort({ reputation: -1 })
+        .limit(10)
+        .lean()
+    ]);
+    
+    res.json({
+      success: true,
+      query: q,
+      discussions: discussions.map(d => Object.assign({}, d, { _id: d._id.toString() })),
+      users: users.map(u => Object.assign({}, u, { id: u._id.toString(), _id: u._id.toString() }))
+    });
+  } catch (error) {
+    console.error('Search error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في البحث' });
   }
 });
 
