@@ -615,6 +615,60 @@ app.get('/api/admin/reset-founders', async (req, res) => {
   }
 });
 
+app.get('/api/admin/cleanup-old-seed', async (req, res) => {
+  try {
+    const key = req.query.key || '';
+    if (key !== 'aporialab2026') {
+      return res.status(403).json({ success: false, message: 'غير مصرح' });
+    }
+
+    const oldSeedUsers = await User.find({ 
+      isFoundingMember: { $ne: true },
+      email: { 
+        $not: /@gmail\.com$/i,
+        $not: /@aporialab\.space$/i
+      }
+    }).select('_id name');
+
+    const userIds = oldSeedUsers.map(u => u._id);
+    const userNames = oldSeedUsers.map(u => u.name);
+
+    if (userIds.length === 0) {
+      return res.json({
+        success: true,
+        message: 'لا يوجد مستخدمين قدامى للحذف',
+        deletedUsers: 0
+      });
+    }
+
+    const deletedDiscussions = await Discussion.deleteMany({
+      'author._id': { $in: userIds }
+    });
+
+    const deletedComments = await Comment.deleteMany({
+      'author._id': { $in: userIds }
+    });
+
+    const deletedUsers = await User.deleteMany({
+      _id: { $in: userIds }
+    });
+
+    res.json({
+      success: true,
+      message: 'تم تنظيف المستخدمين القدامى',
+      deletedUsers: deletedUsers.deletedCount || 0,
+      deletedNames: userNames,
+      deletedDiscussions: deletedDiscussions.deletedCount || 0,
+      deletedComments: deletedComments.deletedCount || 0
+    });
+  } catch (error) {
+    console.error('Cleanup error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم', error: error.message });
+  }
+});
+
+
+
 app.use((req, res) => res.status(404).json({ success: false, message: 'المسار ' + req.path + ' غير موجود' }));
 app.use((err, req, res, next) => {
   if (err.message === 'Not allowed by CORS') return res.status(403).json({ success: false, message: 'غير مسموح' });
