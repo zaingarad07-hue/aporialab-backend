@@ -87,6 +87,7 @@ const UserSchema = new mongoose.Schema({
   bio: { type: String, default: '', maxlength: 500 },
   reputation: { type: Number, default: 0 },
   role: { type: String, enum: ['user', 'moderator', 'admin'], default: 'user' },
+  isFoundingMember: { type: Boolean, default: false },
 }, { timestamps: true });
 
 const DiscussionSchema = new mongoose.Schema({
@@ -154,7 +155,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.4.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
+app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.5.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -198,7 +199,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ success: false, message: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
     const token = jwt.sign({ userId: user._id.toString(), email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ success: true, token, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role } });
+    res.json({ success: true, token, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, isFoundingMember: user.isFoundingMember } });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
@@ -220,10 +221,10 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const newUser = await User.create({
       name, email, password: hashedPassword,
       avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + encodeURIComponent(email),
-      bio: '', reputation: 0, role: 'user'
+      bio: '', reputation: 0, role: 'user', isFoundingMember: false
     });
     const token = jwt.sign({ userId: newUser._id.toString(), email: newUser.email }, JWT_SECRET, { expiresIn: '30d' });
-    res.status(201).json({ success: true, token, user: { id: newUser._id.toString(), _id: newUser._id.toString(), name: newUser.name, email: newUser.email, avatar: newUser.avatar, bio: newUser.bio, reputation: newUser.reputation, role: newUser.role } });
+    res.status(201).json({ success: true, token, user: { id: newUser._id.toString(), _id: newUser._id.toString(), name: newUser.name, email: newUser.email, avatar: newUser.avatar, bio: newUser.bio, reputation: newUser.reputation, role: newUser.role, isFoundingMember: newUser.isFoundingMember } });
   } catch (error) {
     console.error('Register error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
@@ -234,7 +235,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role } });
+    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, isFoundingMember: user.isFoundingMember } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -330,6 +331,32 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
   }
 });
 
+app.delete('/api/comments/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const comment = await Comment.findById(req.params.id);
+    if (!comment) {
+      return res.status(404).json({ success: false, message: 'التعليق غير موجود' });
+    }
+    const userId = req.user.userId;
+    const isOwner = comment.author._id.toString() === userId;
+    const currentUser = await User.findById(userId);
+    const isAdmin = currentUser && (currentUser.role === 'admin' || currentUser.role === 'moderator');
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ success: false, message: 'غير مسموح بحذف هذا التعليق' });
+    }
+    const discussionId = comment.discussionId;
+    await Comment.findByIdAndDelete(req.params.id);
+    await Discussion.findByIdAndUpdate(discussionId, { $inc: { commentCount: -1 } });
+    res.json({ success: true, message: 'تم حذف التعليق' });
+  } catch (error) {
+    console.error('Delete comment error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
 app.get('/api/circles', async (req, res) => {
   try {
     const circles = await Circle.find().lean();
@@ -368,7 +395,7 @@ app.post('/api/circles/:id/join', authMiddleware, async (req, res) => {
 
 app.get('/api/users/leaderboard', async (req, res) => {
   try {
-    const users = await User.find().sort({ reputation: -1 }).limit(10).select('name avatar reputation role').lean();
+    const users = await User.find().sort({ reputation: -1 }).limit(10).select('name avatar reputation role isFoundingMember').lean();
     res.json({ success: true, users: users.map(u => Object.assign({}, u, { id: u._id.toString() })) });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
@@ -380,7 +407,7 @@ app.get('/api/users/profile', authMiddleware, async (req, res) => {
     const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
     const userDiscussions = await Discussion.countDocuments({ 'author._id': user._id });
-    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, discussions: userDiscussions, createdAt: user.createdAt } });
+    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, isFoundingMember: user.isFoundingMember, discussions: userDiscussions, createdAt: user.createdAt } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -394,7 +421,7 @@ app.put('/api/users/profile', authMiddleware, async (req, res) => {
     if (req.body.avatar !== undefined) updates.avatar = sanitizeString(req.body.avatar, 500);
     const user = await User.findByIdAndUpdate(req.user.userId, updates, { new: true });
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role } });
+    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, isFoundingMember: user.isFoundingMember } });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -425,6 +452,7 @@ app.get('/api/users/:id', async (req, res) => {
         bio: user.bio,
         reputation: user.reputation,
         role: user.role,
+        isFoundingMember: user.isFoundingMember,
         discussionCount,
         createdAt: user.createdAt
       },
@@ -469,7 +497,7 @@ app.get('/api/search', async (req, res) => {
           { bio: searchRegex }
         ]
       })
-        .select('name avatar bio reputation role')
+        .select('name avatar bio reputation role isFoundingMember')
         .sort({ reputation: -1 })
         .limit(10)
         .lean()
@@ -484,6 +512,24 @@ app.get('/api/search', async (req, res) => {
   } catch (error) {
     console.error('Search error:', error);
     res.status(500).json({ success: false, message: 'خطأ في البحث' });
+  }
+});
+
+app.post('/api/admin/set-founding', async (req, res) => {
+  try {
+    const key = req.query.key || '';
+    if (key !== 'aporialab2026') {
+      return res.status(403).json({ success: false, message: 'غير مصرح' });
+    }
+    const result = await User.updateMany({}, { $set: { isFoundingMember: true } });
+    res.json({ 
+      success: true, 
+      message: 'تم تعيين المستخدمين كمؤسسين',
+      count: result.modifiedCount || result.nModified || 0
+    });
+  } catch (error) {
+    console.error('Set founding error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
 
