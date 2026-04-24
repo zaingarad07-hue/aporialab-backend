@@ -155,7 +155,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.5.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
+app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.6.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -515,21 +515,103 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-app.post('/api/admin/set-founding', async (req, res) => {
+app.get('/api/admin/reset-founders', async (req, res) => {
   try {
     const key = req.query.key || '';
     if (key !== 'aporialab2026') {
       return res.status(403).json({ success: false, message: 'غير مصرح' });
     }
-    const result = await User.updateMany({}, { $set: { isFoundingMember: true } });
+
+    const foundingPhilosophers = [
+      {
+        name: 'Ibn Rushd',
+        email: 'ibn.rushd@aporialab.space',
+        bio: 'Andalusian philosopher (Averroes). Commentator on Aristotle. Champion of rationalism.',
+        reputation: 300,
+        role: 'moderator',
+        seed: 'ibnrushd'
+      },
+      {
+        name: 'Al-Kindi',
+        email: 'alkindi@aporialab.space',
+        bio: 'First of the Arab philosophers. Pioneer in philosophy of science, mathematics, and cryptography.',
+        reputation: 250,
+        role: 'user',
+        seed: 'alkindi'
+      },
+      {
+        name: 'Hypatia',
+        email: 'hypatia@aporialab.space',
+        bio: 'Hellenistic philosopher, astronomer, and mathematician of Alexandria. Symbol of reason and inquiry.',
+        reputation: 220,
+        role: 'user',
+        seed: 'hypatia'
+      },
+      {
+        name: 'Avicenna',
+        email: 'avicenna@aporialab.space',
+        bio: 'Ibn Sina. Father of early modern medicine. Philosopher of metaphysics and consciousness.',
+        reputation: 200,
+        role: 'user',
+        seed: 'avicenna'
+      },
+      {
+        name: 'Socrates',
+        email: 'socrates@aporialab.space',
+        bio: 'The Athenian gadfly. Father of Western philosophy. "I know that I know nothing."',
+        reputation: 180,
+        role: 'user',
+        seed: 'socrates'
+      }
+    ];
+
+    const deleteResult = await User.deleteMany({ 
+      email: { $regex: '@(example|test|noemail)\\.', $options: 'i' } 
+    });
+
+    let created = 0;
+    let updated = 0;
+
+    for (const p of foundingPhilosophers) {
+      const hashedPassword = await bcrypt.hash('AporiaLab2026!Founder', 10);
+      const avatarUrl = 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + p.seed;
+      
+      const existing = await User.findOne({ email: p.email });
+      if (existing) {
+        await User.findByIdAndUpdate(existing._id, {
+          name: p.name,
+          bio: p.bio,
+          reputation: p.reputation,
+          role: p.role,
+          avatar: avatarUrl,
+          isFoundingMember: true
+        });
+        updated++;
+      } else {
+        await User.create({
+          name: p.name,
+          email: p.email,
+          password: hashedPassword,
+          bio: p.bio,
+          reputation: p.reputation,
+          role: p.role,
+          avatar: avatarUrl,
+          isFoundingMember: true
+        });
+        created++;
+      }
+    }
+
     res.json({ 
       success: true, 
-      message: 'تم تعيين المستخدمين كمؤسسين',
-      count: result.modifiedCount || result.nModified || 0
+      message: 'تم تحديث المفكرين المؤسسين',
+      created,
+      updated,
+      deletedTestUsers: deleteResult.deletedCount || 0
     });
   } catch (error) {
-    console.error('Set founding error:', error);
-    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+    console.error('Reset founders error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم', error: error.message });
   }
 });
 
