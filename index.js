@@ -5,6 +5,7 @@ const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const mongoose = require('mongoose');
+const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
 
@@ -57,10 +58,22 @@ const authLimiter = rateLimit({
   skipSuccessfulRequests: true,
 });
 
+const googleAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { success: false, message: 'الكثير من محاولات تسجيل الدخول. حاول بعد 15 دقيقة.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+});
+
 app.use('/api/', generalLimiter);
 
 const JWT_SECRET = process.env.JWT_SECRET || 'aporialab-secret-key-2026';
 const MONGODB_URI = process.env.MONGODB_URI;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+
+const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
 let cachedConnection = null;
 async function connectDB() {
@@ -82,7 +95,10 @@ async function connectDB() {
 const UserSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 100 },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true, maxlength: 200 },
-  password: { type: String, required: true },
+  password: { type: String, default: '' },
+  googleId: { type: String, default: null, sparse: true, index: true },
+  authProvider: { type: String, enum: ['local', 'google'], default: 'local' },
+  emailVerified: { type: Boolean, default: false },
   avatar: { type: String, default: '' },
   bio: { type: String, default: '', maxlength: 500 },
   reputation: { type: Number, default: 0 },
@@ -140,6 +156,22 @@ function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
+function userToResponse(user) {
+  return {
+    id: user._id.toString(),
+    _id: user._id.toString(),
+    name: user.name,
+    email: user.email,
+    avatar: user.avatar,
+    bio: user.bio,
+    reputation: user.reputation,
+    role: user.role,
+    isFoundingMember: user.isFoundingMember,
+    authProvider: user.authProvider,
+    emailVerified: user.emailVerified
+  };
+}
+
 app.use(async (req, res, next) => {
   try { await connectDB(); next(); } catch (e) { res.status(503).json({ success: false, message: 'خطأ في الاتصال بقاعدة البيانات' }); }
 });
@@ -155,7 +187,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.7.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
+app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.8.0', status: 'running', database: 'MongoDB', security: 'enhanced', auth: 'local + google' }));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -189,6 +221,84 @@ app.get('/api/stats', async (req, res) => {
   }
 });
 
+app.post('/api/auth/google', googleAuthLimiter, async (req, res) => {
+  try {
+    if (!GOOGLE_CLIENT_ID) {
+      return res.status(503).json({ success: false, message: 'خدمة Google غير مفعّلة على الخادم' });
+    }
+
+    const credential = req.body.credential;
+    if (!credential || typeof credential !== 'string') {
+      return res.status(400).json({ success: false, message: 'بيانات Google غير صحيحة' });
+    }
+
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } catch (verifyError) {
+      console.error('Google token verification failed:', verifyError.message);
+      return res.status(401).json({ success: false, message: 'فشل التحقق من Google' });
+    }
+
+    if (!payload || !payload.email) {
+      return res.status(401).json({ success: false, message: 'بيانات Google غير مكتملة' });
+    }
+
+    if (!payload.email_verified) {
+      return res.status(403).json({ success: false, message: 'بريدك الإلكتروني في Google غير موثّق' });
+    }
+
+    const googleId = payload.sub;
+    const email = payload.email.toLowerCase();
+    const googleName = payload.name || payload.given_name || email.split('@')[0];
+    const googlePicture = payload.picture || '';
+
+    let user = await User.findOne({ googleId });
+
+    if (!user) {
+      user = await User.findOne({ email });
+      
+      if (user) {
+        user.googleId = googleId;
+        user.authProvider = 'google';
+        user.emailVerified = true;
+        if (!user.avatar && googlePicture) user.avatar = googlePicture;
+        await user.save();
+      } else {
+        const randomPassword = await bcrypt.hash(googleId + Date.now().toString(), 10);
+        user = await User.create({
+          name: sanitizeString(googleName, 100),
+          email,
+          password: randomPassword,
+          googleId,
+          authProvider: 'google',
+          emailVerified: true,
+          avatar: googlePicture || ('https://api.dicebear.com/7.x/avataaars/svg?seed=' + encodeURIComponent(email)),
+          bio: '',
+          reputation: 0,
+          role: 'user',
+          isFoundingMember: false
+        });
+      }
+    }
+
+    const token = jwt.sign(
+      { userId: user._id.toString(), email: user.email },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({ success: true, token, user: userToResponse(user) });
+  } catch (error) {
+    console.error('Google auth error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
 app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const email = sanitizeString(req.body.email, 200).toLowerCase();
@@ -196,10 +306,13 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     if (!isValidEmail(email) || !password) return res.status(400).json({ success: false, message: 'بيانات غير صحيحة' });
     const user = await User.findOne({ email });
     if (!user) return res.status(401).json({ success: false, message: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
+    if (user.authProvider === 'google' && !user.password) {
+      return res.status(401).json({ success: false, message: 'هذا الحساب يُسجّل الدخول بـ Google' });
+    }
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ success: false, message: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
     const token = jwt.sign({ userId: user._id.toString(), email: user.email }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ success: true, token, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, isFoundingMember: user.isFoundingMember } });
+    res.json({ success: true, token, user: userToResponse(user) });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
@@ -220,11 +333,13 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const newUser = await User.create({
       name, email, password: hashedPassword,
+      authProvider: 'local',
+      emailVerified: false,
       avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + encodeURIComponent(email),
       bio: '', reputation: 0, role: 'user', isFoundingMember: false
     });
     const token = jwt.sign({ userId: newUser._id.toString(), email: newUser.email }, JWT_SECRET, { expiresIn: '30d' });
-    res.status(201).json({ success: true, token, user: { id: newUser._id.toString(), _id: newUser._id.toString(), name: newUser.name, email: newUser.email, avatar: newUser.avatar, bio: newUser.bio, reputation: newUser.reputation, role: newUser.role, isFoundingMember: newUser.isFoundingMember } });
+    res.status(201).json({ success: true, token, user: userToResponse(newUser) });
   } catch (error) {
     console.error('Register error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
@@ -235,7 +350,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
     const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, isFoundingMember: user.isFoundingMember } });
+    res.json({ success: true, user: userToResponse(user) });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -407,7 +522,7 @@ app.get('/api/users/profile', authMiddleware, async (req, res) => {
     const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
     const userDiscussions = await Discussion.countDocuments({ 'author._id': user._id });
-    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, isFoundingMember: user.isFoundingMember, discussions: userDiscussions, createdAt: user.createdAt } });
+    res.json({ success: true, user: Object.assign({}, userToResponse(user), { discussions: userDiscussions, createdAt: user.createdAt }) });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -421,7 +536,7 @@ app.put('/api/users/profile', authMiddleware, async (req, res) => {
     if (req.body.avatar !== undefined) updates.avatar = sanitizeString(req.body.avatar, 500);
     const user = await User.findByIdAndUpdate(req.user.userId, updates, { new: true });
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-    res.json({ success: true, user: { id: user._id.toString(), _id: user._id.toString(), name: user.name, email: user.email, avatar: user.avatar, bio: user.bio, reputation: user.reputation, role: user.role, isFoundingMember: user.isFoundingMember } });
+    res.json({ success: true, user: userToResponse(user) });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -523,46 +638,11 @@ app.get('/api/admin/reset-founders', async (req, res) => {
     }
 
     const foundingPhilosophers = [
-      {
-        name: 'Ibn Rushd',
-        email: 'ibn.rushd@aporialab.space',
-        bio: 'Andalusian philosopher (Averroes). Commentator on Aristotle. Champion of rationalism.',
-        reputation: 300,
-        role: 'moderator',
-        seed: 'ibnrushd'
-      },
-      {
-        name: 'Al-Kindi',
-        email: 'alkindi@aporialab.space',
-        bio: 'First of the Arab philosophers. Pioneer in philosophy of science, mathematics, and cryptography.',
-        reputation: 250,
-        role: 'user',
-        seed: 'alkindi'
-      },
-      {
-        name: 'Hypatia',
-        email: 'hypatia@aporialab.space',
-        bio: 'Hellenistic philosopher, astronomer, and mathematician of Alexandria. Symbol of reason and inquiry.',
-        reputation: 220,
-        role: 'user',
-        seed: 'hypatia'
-      },
-      {
-        name: 'Avicenna',
-        email: 'avicenna@aporialab.space',
-        bio: 'Ibn Sina. Father of early modern medicine. Philosopher of metaphysics and consciousness.',
-        reputation: 200,
-        role: 'user',
-        seed: 'avicenna'
-      },
-      {
-        name: 'Socrates',
-        email: 'socrates@aporialab.space',
-        bio: 'The Athenian gadfly. Father of Western philosophy. "I know that I know nothing."',
-        reputation: 180,
-        role: 'user',
-        seed: 'socrates'
-      }
+      { name: 'Ibn Rushd', email: 'ibn.rushd@aporialab.space', bio: 'Andalusian philosopher (Averroes). Commentator on Aristotle. Champion of rationalism.', reputation: 300, role: 'moderator', seed: 'ibnrushd' },
+      { name: 'Al-Kindi', email: 'alkindi@aporialab.space', bio: 'First of the Arab philosophers. Pioneer in philosophy of science, mathematics, and cryptography.', reputation: 250, role: 'user', seed: 'alkindi' },
+      { name: 'Hypatia', email: 'hypatia@aporialab.space', bio: 'Hellenistic philosopher, astronomer, and mathematician of Alexandria. Symbol of reason and inquiry.', reputation: 220, role: 'user', seed: 'hypatia' },
+      { name: 'Avicenna', email: 'avicenna@aporialab.space', bio: 'Ibn Sina. Father of early modern medicine. Philosopher of metaphysics and consciousness.', reputation: 200, role: 'user', seed: 'avicenna' },
+      { name: 'Socrates', email: 'socrates@aporialab.space', bio: 'The Athenian gadfly. Father of Western philosophy. "I know that I know nothing."', reputation: 180, role: 'user', seed: 'socrates' }
     ];
 
     let created = 0;
@@ -575,35 +655,22 @@ app.get('/api/admin/reset-founders', async (req, res) => {
       const existing = await User.findOne({ email: p.email });
       if (existing) {
         await User.findByIdAndUpdate(existing._id, {
-          name: p.name,
-          bio: p.bio,
-          reputation: p.reputation,
-          role: p.role,
-          avatar: avatarUrl,
-          isFoundingMember: true
+          name: p.name, bio: p.bio, reputation: p.reputation,
+          role: p.role, avatar: avatarUrl, isFoundingMember: true
         });
         updated++;
       } else {
         await User.create({
-          name: p.name,
-          email: p.email,
-          password: hashedPassword,
-          bio: p.bio,
-          reputation: p.reputation,
-          role: p.role,
-          avatar: avatarUrl,
-          isFoundingMember: true
+          name: p.name, email: p.email, password: hashedPassword,
+          authProvider: 'local', emailVerified: true,
+          bio: p.bio, reputation: p.reputation, role: p.role,
+          avatar: avatarUrl, isFoundingMember: true
         });
         created++;
       }
     }
 
-    res.json({ 
-      success: true, 
-      message: 'تم تحديث المفكرين المؤسسين',
-      created,
-      updated
-    });
+    res.json({ success: true, message: 'تم تحديث المفكرين المؤسسين', created, updated });
   } catch (error) {
     console.error('Reset founders error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم', error: error.message });
@@ -617,36 +684,20 @@ app.get('/api/admin/cleanup-non-founders', async (req, res) => {
       return res.status(403).json({ success: false, message: 'غير مصرح' });
     }
 
-    const nonFounders = await User.find({ 
-      isFoundingMember: { $ne: true }
-    }).select('_id name email');
-
+    const nonFounders = await User.find({ isFoundingMember: { $ne: true } }).select('_id name email');
     const userIds = nonFounders.map(u => u._id);
     const userInfo = nonFounders.map(u => ({ name: u.name, email: u.email }));
 
     if (userIds.length === 0) {
-      return res.json({
-        success: true,
-        message: 'لا يوجد مستخدمين للحذف',
-        deletedUsers: 0
-      });
+      return res.json({ success: true, message: 'لا يوجد مستخدمين للحذف', deletedUsers: 0 });
     }
 
-    const deletedDiscussions = await Discussion.deleteMany({
-      'author._id': { $in: userIds }
-    });
-
-    const deletedComments = await Comment.deleteMany({
-      'author._id': { $in: userIds }
-    });
-
-    const deletedUsers = await User.deleteMany({
-      _id: { $in: userIds }
-    });
+    const deletedDiscussions = await Discussion.deleteMany({ 'author._id': { $in: userIds } });
+    const deletedComments = await Comment.deleteMany({ 'author._id': { $in: userIds } });
+    const deletedUsers = await User.deleteMany({ _id: { $in: userIds } });
 
     res.json({
-      success: true,
-      message: 'تم حذف كل المستخدمين غير المؤسسين',
+      success: true, message: 'تم حذف كل المستخدمين غير المؤسسين',
       deletedUsers: deletedUsers.deletedCount || 0,
       deletedNames: userInfo,
       deletedDiscussions: deletedDiscussions.deletedCount || 0,
