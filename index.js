@@ -75,6 +75,13 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
+const VALID_DURATIONS = {
+  '12h': 12 * 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '3d': 3 * 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+};
+
 let cachedConnection = null;
 async function connectDB() {
   if (cachedConnection && mongoose.connection.readyState === 1) return cachedConnection;
@@ -113,11 +120,18 @@ const DiscussionSchema = new mongoose.Schema({
   tags: [{ type: String, maxlength: 50 }],
   author: {
     _id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    name: String, avatar: String, reputation: Number
+    name: String, avatar: String, reputation: Number, isFoundingMember: Boolean
   },
   views: { type: Number, default: 0 },
   upvotes: [{ type: String }],
   commentCount: { type: Number, default: 0 },
+  expiresAt: { type: Date, default: null },
+  duration: { type: String, enum: ['12h', '24h', '3d', '7d', null], default: null },
+  stanceStats: {
+    pro: { type: Number, default: 0 },
+    con: { type: Number, default: 0 },
+    neutral: { type: Number, default: 0 },
+  },
 }, { timestamps: true });
 
 const CommentSchema = new mongoose.Schema({
@@ -125,9 +139,17 @@ const CommentSchema = new mongoose.Schema({
   content: { type: String, required: true, maxlength: 5000 },
   author: {
     _id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    name: String, avatar: String, reputation: Number
+    name: String, avatar: String, reputation: Number, isFoundingMember: Boolean
   },
+  stance: { type: String, enum: ['pro', 'con', 'neutral'], required: true },
   upvotes: [{ type: String }],
+  reactions: {
+    logical: [{ type: String }],
+    evidenced: [{ type: String }],
+    insightful: [{ type: String }],
+    clarify: [{ type: String }],
+  },
+  qualityScore: { type: Number, default: 0 },
 }, { timestamps: true });
 
 const CircleSchema = new mongoose.Schema({
@@ -154,6 +176,24 @@ function sanitizeString(str, maxLen) {
 
 function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function isDiscussionExpired(discussion) {
+  if (!discussion.expiresAt) return false;
+  return new Date() > new Date(discussion.expiresAt);
+}
+
+function calculateQualityScore(comment) {
+  const upvotes = (comment.upvotes || []).length;
+  const logical = (comment.reactions?.logical || []).length;
+  const evidenced = (comment.reactions?.evidenced || []).length;
+  const insightful = (comment.reactions?.insightful || []).length;
+  const clarify = (comment.reactions?.clarify || []).length;
+  
+  const positive = upvotes * 3 + logical * 2 + evidenced * 2 + insightful * 1.5;
+  const negative = clarify * 0.5;
+  
+  return Math.max(0, Math.round(positive - negative));
 }
 
 function userToResponse(user) {
@@ -187,7 +227,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.8.0', status: 'running', database: 'MongoDB', security: 'enhanced', auth: 'local + google' }));
+app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.9.0', status: 'running', database: 'MongoDB', security: 'enhanced', auth: 'local + google', features: 'stances + reactions + timer' }));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -372,7 +412,14 @@ app.get('/api/discussions', async (req, res) => {
     else if (sort === 'live') sortObj = { commentCount: -1 };
     const total = await Discussion.countDocuments(query);
     const discussions = await Discussion.find(query).sort(sortObj).skip((page - 1) * limit).limit(limit).lean();
-    res.json({ success: true, discussions: discussions.map(d => Object.assign({}, d, { _id: d._id.toString() })), pagination: { page, pages: Math.ceil(total / limit), total } });
+    res.json({ 
+      success: true, 
+      discussions: discussions.map(d => Object.assign({}, d, { 
+        _id: d._id.toString(),
+        isExpired: isDiscussionExpired(d)
+      })), 
+      pagination: { page, pages: Math.ceil(total / limit), total } 
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -383,8 +430,30 @@ app.get('/api/discussions/:id', async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const discussion = await Discussion.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } }, { new: true }).lean();
     if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
-    const comments = await Comment.find({ discussionId: req.params.id }).sort({ createdAt: -1 }).lean();
-    res.json({ success: true, discussion: Object.assign({}, discussion, { _id: discussion._id.toString(), comments }) });
+    
+    const comments = await Comment.find({ discussionId: req.params.id })
+      .sort({ qualityScore: -1, createdAt: -1 })
+      .lean();
+    
+    const enrichedComments = comments.map(c => ({
+      ...c,
+      _id: c._id.toString(),
+      reactions: {
+        logical: c.reactions?.logical || [],
+        evidenced: c.reactions?.evidenced || [],
+        insightful: c.reactions?.insightful || [],
+        clarify: c.reactions?.clarify || [],
+      }
+    }));
+    
+    res.json({ 
+      success: true, 
+      discussion: Object.assign({}, discussion, { 
+        _id: discussion._id.toString(), 
+        comments: enrichedComments,
+        isExpired: isDiscussionExpired(discussion)
+      }) 
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -396,17 +465,39 @@ app.post('/api/discussions', authMiddleware, async (req, res) => {
     const content = sanitizeString(req.body.content || req.body.description, 10000);
     const level = ['beginner', 'intermediate', 'advanced'].includes(req.body.level) ? req.body.level : 'beginner';
     const tags = Array.isArray(req.body.tags) ? req.body.tags.slice(0, 10).map(t => sanitizeString(t, 50)).filter(Boolean) : [];
+    const duration = req.body.duration && Object.keys(VALID_DURATIONS).includes(req.body.duration) ? req.body.duration : null;
+    
     if (!title || title.length < 5) return res.status(400).json({ success: false, message: 'العنوان قصير جداً' });
     if (!content || content.length < 10) return res.status(400).json({ success: false, message: 'المحتوى قصير جداً' });
+    
     const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    
+    const expiresAt = duration ? new Date(Date.now() + VALID_DURATIONS[duration]) : null;
+    
     const newDiscussion = await Discussion.create({
       title, content, category: level, tags,
-      author: { _id: user._id, name: user.name, avatar: user.avatar, reputation: user.reputation }
+      author: { 
+        _id: user._id, 
+        name: user.name, 
+        avatar: user.avatar, 
+        reputation: user.reputation,
+        isFoundingMember: user.isFoundingMember
+      },
+      duration,
+      expiresAt,
+      stanceStats: { pro: 0, con: 0, neutral: 0 }
     });
     await User.findByIdAndUpdate(user._id, { $inc: { reputation: 10 } });
-    res.status(201).json({ success: true, discussion: Object.assign({}, newDiscussion.toObject(), { _id: newDiscussion._id.toString() }) });
+    res.status(201).json({ 
+      success: true, 
+      discussion: Object.assign({}, newDiscussion.toObject(), { 
+        _id: newDiscussion._id.toString(),
+        isExpired: false
+      }) 
+    });
   } catch (error) {
+    console.error('Create discussion error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
@@ -416,6 +507,7 @@ app.post('/api/discussions/:id/like', authMiddleware, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const discussion = await Discussion.findById(req.params.id);
     if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
+    if (isDiscussionExpired(discussion)) return res.status(403).json({ success: false, message: 'انتهى وقت النقاش' });
     const userId = req.user.userId;
     const likeIndex = discussion.upvotes.indexOf(userId);
     if (likeIndex === -1) discussion.upvotes.push(userId);
@@ -432,16 +524,145 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const discussion = await Discussion.findById(req.params.id);
     if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
+    if (isDiscussionExpired(discussion)) return res.status(403).json({ success: false, message: 'انتهى وقت النقاش - لا يمكن إضافة تعليقات جديدة' });
+    
     const content = sanitizeString(req.body.content, 5000);
+    const stance = req.body.stance;
+    
     if (!content) return res.status(400).json({ success: false, message: 'محتوى التعليق مطلوب' });
+    if (!['pro', 'con', 'neutral'].includes(stance)) {
+      return res.status(400).json({ success: false, message: 'يجب اختيار موقف (مع/ضد/محايد)' });
+    }
+    
     const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    
     const newComment = await Comment.create({
-      discussionId: req.params.id, content,
-      author: { _id: user._id, name: user.name, avatar: user.avatar, reputation: user.reputation }
+      discussionId: req.params.id, 
+      content,
+      stance,
+      author: { 
+        _id: user._id, 
+        name: user.name, 
+        avatar: user.avatar, 
+        reputation: user.reputation,
+        isFoundingMember: user.isFoundingMember
+      },
+      reactions: {
+        logical: [],
+        evidenced: [],
+        insightful: [],
+        clarify: [],
+      },
+      qualityScore: 0
     });
-    await Discussion.findByIdAndUpdate(req.params.id, { $inc: { commentCount: 1 } });
-    res.status(201).json({ success: true, comment: Object.assign({}, newComment.toObject(), { _id: newComment._id.toString() }) });
+    
+    const stanceField = `stanceStats.${stance}`;
+    await Discussion.findByIdAndUpdate(req.params.id, { 
+      $inc: { commentCount: 1, [stanceField]: 1 } 
+    });
+    
+    res.status(201).json({ 
+      success: true, 
+      comment: Object.assign({}, newComment.toObject(), { _id: newComment._id.toString() }) 
+    });
   } catch (error) {
+    console.error('Add comment error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.post('/api/comments/:id/upvote', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const comment = await Comment.findById(req.params.id);
+    if (!comment) return res.status(404).json({ success: false, message: 'التعليق غير موجود' });
+    
+    const discussion = await Discussion.findById(comment.discussionId);
+    if (discussion && isDiscussionExpired(discussion)) {
+      return res.status(403).json({ success: false, message: 'انتهى وقت النقاش' });
+    }
+    
+    const userId = req.user.userId;
+    const upvoteIndex = comment.upvotes.indexOf(userId);
+    
+    if (upvoteIndex === -1) {
+      comment.upvotes.push(userId);
+    } else {
+      comment.upvotes.splice(upvoteIndex, 1);
+    }
+    
+    comment.qualityScore = calculateQualityScore(comment);
+    await comment.save();
+    
+    res.json({ 
+      success: true, 
+      upvoted: upvoteIndex === -1, 
+      upvotesCount: comment.upvotes.length,
+      qualityScore: comment.qualityScore
+    });
+  } catch (error) {
+    console.error('Upvote comment error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.post('/api/comments/:id/react', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    
+    const reactionType = req.body.type;
+    const validReactions = ['logical', 'evidenced', 'insightful', 'clarify'];
+    if (!validReactions.includes(reactionType)) {
+      return res.status(400).json({ success: false, message: 'نوع التفاعل غير صحيح' });
+    }
+    
+    const comment = await Comment.findById(req.params.id);
+    if (!comment) return res.status(404).json({ success: false, message: 'التعليق غير موجود' });
+    
+    const discussion = await Discussion.findById(comment.discussionId);
+    if (discussion && isDiscussionExpired(discussion)) {
+      return res.status(403).json({ success: false, message: 'انتهى وقت النقاش' });
+    }
+    
+    if (!comment.reactions) {
+      comment.reactions = { logical: [], evidenced: [], insightful: [], clarify: [] };
+    }
+    if (!comment.reactions[reactionType]) {
+      comment.reactions[reactionType] = [];
+    }
+    
+    const userId = req.user.userId;
+    const reactionIndex = comment.reactions[reactionType].indexOf(userId);
+    
+    if (reactionIndex === -1) {
+      comment.reactions[reactionType].push(userId);
+    } else {
+      comment.reactions[reactionType].splice(reactionIndex, 1);
+    }
+    
+    comment.qualityScore = calculateQualityScore(comment);
+    comment.markModified('reactions');
+    await comment.save();
+    
+    res.json({ 
+      success: true, 
+      reactionType,
+      active: reactionIndex === -1,
+      counts: {
+        logical: comment.reactions.logical.length,
+        evidenced: comment.reactions.evidenced.length,
+        insightful: comment.reactions.insightful.length,
+        clarify: comment.reactions.clarify.length,
+      },
+      qualityScore: comment.qualityScore
+    });
+  } catch (error) {
+    console.error('React to comment error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
@@ -462,9 +683,16 @@ app.delete('/api/comments/:id', authMiddleware, async (req, res) => {
     if (!isOwner && !isAdmin) {
       return res.status(403).json({ success: false, message: 'غير مسموح بحذف هذا التعليق' });
     }
+    
     const discussionId = comment.discussionId;
+    const stance = comment.stance;
+    const stanceField = `stanceStats.${stance}`;
+    
     await Comment.findByIdAndDelete(req.params.id);
-    await Discussion.findByIdAndUpdate(discussionId, { $inc: { commentCount: -1 } });
+    await Discussion.findByIdAndUpdate(discussionId, { 
+      $inc: { commentCount: -1, [stanceField]: -1 } 
+    });
+    
     res.json({ success: true, message: 'تم حذف التعليق' });
   } catch (error) {
     console.error('Delete comment error:', error);
@@ -571,7 +799,10 @@ app.get('/api/users/:id', async (req, res) => {
         discussionCount,
         createdAt: user.createdAt
       },
-      discussions: discussions.map(d => Object.assign({}, d, { _id: d._id.toString() }))
+      discussions: discussions.map(d => Object.assign({}, d, { 
+        _id: d._id.toString(),
+        isExpired: isDiscussionExpired(d)
+      }))
     });
   } catch (error) {
     console.error('Get user by id error:', error);
@@ -621,7 +852,10 @@ app.get('/api/search', async (req, res) => {
     res.json({
       success: true,
       query: q,
-      discussions: discussions.map(d => Object.assign({}, d, { _id: d._id.toString() })),
+      discussions: discussions.map(d => Object.assign({}, d, { 
+        _id: d._id.toString(),
+        isExpired: isDiscussionExpired(d)
+      })),
       users: users.map(u => Object.assign({}, u, { id: u._id.toString(), _id: u._id.toString() }))
     });
   } catch (error) {
