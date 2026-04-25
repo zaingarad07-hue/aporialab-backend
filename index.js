@@ -155,7 +155,7 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.6.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
+app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.7.0', status: 'running', database: 'MongoDB', security: 'enhanced' }));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -565,10 +565,6 @@ app.get('/api/admin/reset-founders', async (req, res) => {
       }
     ];
 
-    const deleteResult = await User.deleteMany({ 
-      email: { $regex: '@(example|test|noemail)\\.', $options: 'i' } 
-    });
-
     let created = 0;
     let updated = 0;
 
@@ -606,8 +602,7 @@ app.get('/api/admin/reset-founders', async (req, res) => {
       success: true, 
       message: 'تم تحديث المفكرين المؤسسين',
       created,
-      updated,
-      deletedTestUsers: deleteResult.deletedCount || 0
+      updated
     });
   } catch (error) {
     console.error('Reset founders error:', error);
@@ -615,28 +610,24 @@ app.get('/api/admin/reset-founders', async (req, res) => {
   }
 });
 
-app.get('/api/admin/cleanup-old-seed', async (req, res) => {
+app.get('/api/admin/cleanup-non-founders', async (req, res) => {
   try {
     const key = req.query.key || '';
     if (key !== 'aporialab2026') {
       return res.status(403).json({ success: false, message: 'غير مصرح' });
     }
 
-    const oldSeedUsers = await User.find({ 
-      isFoundingMember: { $ne: true },
-      email: { 
-        $not: /@gmail\.com$/i,
-        $not: /@aporialab\.space$/i
-      }
-    }).select('_id name');
+    const nonFounders = await User.find({ 
+      isFoundingMember: { $ne: true }
+    }).select('_id name email');
 
-    const userIds = oldSeedUsers.map(u => u._id);
-    const userNames = oldSeedUsers.map(u => u.name);
+    const userIds = nonFounders.map(u => u._id);
+    const userInfo = nonFounders.map(u => ({ name: u.name, email: u.email }));
 
     if (userIds.length === 0) {
       return res.json({
         success: true,
-        message: 'لا يوجد مستخدمين قدامى للحذف',
+        message: 'لا يوجد مستخدمين للحذف',
         deletedUsers: 0
       });
     }
@@ -655,9 +646,9 @@ app.get('/api/admin/cleanup-old-seed', async (req, res) => {
 
     res.json({
       success: true,
-      message: 'تم تنظيف المستخدمين القدامى',
+      message: 'تم حذف كل المستخدمين غير المؤسسين',
       deletedUsers: deletedUsers.deletedCount || 0,
-      deletedNames: userNames,
+      deletedNames: userInfo,
       deletedDiscussions: deletedDiscussions.deletedCount || 0,
       deletedComments: deletedComments.deletedCount || 0
     });
@@ -666,8 +657,6 @@ app.get('/api/admin/cleanup-old-seed', async (req, res) => {
     res.status(500).json({ success: false, message: 'خطأ في الخادم', error: error.message });
   }
 });
-
-
 
 app.use((req, res) => res.status(404).json({ success: false, message: 'المسار ' + req.path + ' غير موجود' }));
 app.use((err, req, res, next) => {
