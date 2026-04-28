@@ -82,6 +82,18 @@ const VALID_DURATIONS = {
   '7d': 7 * 24 * 60 * 60 * 1000,
 };
 
+const MAX_REACTIONS_PER_USER = 2;
+
+const REPUTATION_REWARDS = {
+  CREATE_DISCUSSION: 10,
+  CREATE_COMMENT: 2,
+  RECEIVE_UPVOTE: 5,
+  RECEIVE_LOGICAL: 3,
+  RECEIVE_INSPIRING: 2,
+  RECEIVE_ILLOGICAL: -2,
+  RECEIVE_UNCLEAR: -1,
+};
+
 let cachedConnection = null;
 async function connectDB() {
   if (cachedConnection && mongoose.connection.readyState === 1) return cachedConnection;
@@ -113,6 +125,17 @@ const UserSchema = new mongoose.Schema({
   isFoundingMember: { type: Boolean, default: false },
 }, { timestamps: true });
 
+const EditHistoryEntrySchema = new mongoose.Schema({
+  editedAt: { type: Date, default: Date.now },
+  editedBy: {
+    _id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    name: String,
+  },
+  previousTitle: String,
+  previousContent: String,
+  reason: { type: String, default: '' },
+}, { _id: false });
+
 const DiscussionSchema = new mongoose.Schema({
   title: { type: String, required: true, trim: true, maxlength: 200 },
   content: { type: String, required: true, maxlength: 10000 },
@@ -132,6 +155,9 @@ const DiscussionSchema = new mongoose.Schema({
     con: { type: Number, default: 0 },
     neutral: { type: Number, default: 0 },
   },
+  editHistory: [EditHistoryEntrySchema],
+  editedAt: { type: Date, default: null },
+  editsCount: { type: Number, default: 0 },
 }, { timestamps: true });
 
 const CommentSchema = new mongoose.Schema({
@@ -145,11 +171,14 @@ const CommentSchema = new mongoose.Schema({
   upvotes: [{ type: String }],
   reactions: {
     logical: [{ type: String }],
-    evidenced: [{ type: String }],
-    insightful: [{ type: String }],
-    clarify: [{ type: String }],
+    illogical: [{ type: String }],
+    inspiring: [{ type: String }],
+    unclear: [{ type: String }],
   },
   qualityScore: { type: Number, default: 0 },
+  parentCommentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Comment', default: null },
+  isReply: { type: Boolean, default: false },
+  editedAt: { type: Date, default: null },
 }, { timestamps: true });
 
 const CircleSchema = new mongoose.Schema({
@@ -186,14 +215,14 @@ function isDiscussionExpired(discussion) {
 function calculateQualityScore(comment) {
   const upvotes = (comment.upvotes || []).length;
   const logical = (comment.reactions?.logical || []).length;
-  const evidenced = (comment.reactions?.evidenced || []).length;
-  const insightful = (comment.reactions?.insightful || []).length;
-  const clarify = (comment.reactions?.clarify || []).length;
+  const illogical = (comment.reactions?.illogical || []).length;
+  const inspiring = (comment.reactions?.inspiring || []).length;
+  const unclear = (comment.reactions?.unclear || []).length;
   
-  const positive = upvotes * 3 + logical * 2 + evidenced * 2 + insightful * 1.5;
-  const negative = clarify * 0.5;
+  const positive = upvotes * 3 + logical * 2 + inspiring * 1.5;
+  const negative = illogical * 2 + unclear * 0.5;
   
-  return Math.max(0, Math.round(positive - negative));
+  return Math.round(positive - negative);
 }
 
 function userToResponse(user) {
@@ -212,6 +241,15 @@ function userToResponse(user) {
   };
 }
 
+async function updateAuthorReputation(authorId, points) {
+  if (!authorId || !points) return;
+  try {
+    await User.findByIdAndUpdate(authorId, { $inc: { reputation: points } });
+  } catch (e) {
+    console.error('Reputation update failed:', e.message);
+  }
+}
+
 app.use(async (req, res, next) => {
   try { await connectDB(); next(); } catch (e) { res.status(503).json({ success: false, message: 'خطأ في الاتصال بقاعدة البيانات' }); }
 });
@@ -227,7 +265,15 @@ function authMiddleware(req, res, next) {
   }
 }
 
-app.get('/', (req, res) => res.json({ name: 'AporiaLab API', version: '3.9.0', status: 'running', database: 'MongoDB', security: 'enhanced', auth: 'local + google', features: 'stances + reactions + timer' }));
+app.get('/', (req, res) => res.json({ 
+  name: 'AporiaLab API', 
+  version: '4.0.0', 
+  status: 'running', 
+  database: 'MongoDB', 
+  security: 'enhanced', 
+  auth: 'local + google', 
+  features: 'stances + reactions + timer + replies + edit history + reputation system' 
+}));
 
 app.get('/api/health', async (req, res) => {
   try {
@@ -438,11 +484,12 @@ app.get('/api/discussions/:id', async (req, res) => {
     const enrichedComments = comments.map(c => ({
       ...c,
       _id: c._id.toString(),
+      parentCommentId: c.parentCommentId ? c.parentCommentId.toString() : null,
       reactions: {
         logical: c.reactions?.logical || [],
-        evidenced: c.reactions?.evidenced || [],
-        insightful: c.reactions?.insightful || [],
-        clarify: c.reactions?.clarify || [],
+        illogical: c.reactions?.illogical || [],
+        inspiring: c.reactions?.inspiring || [],
+        unclear: c.reactions?.unclear || [],
       }
     }));
     
@@ -455,6 +502,28 @@ app.get('/api/discussions/:id', async (req, res) => {
       }) 
     });
   } catch (error) {
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/discussions/:id/history', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const discussion = await Discussion.findById(req.params.id).lean();
+    if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
+    
+    res.json({
+      success: true,
+      editHistory: discussion.editHistory || [],
+      editsCount: discussion.editsCount || 0,
+      editedAt: discussion.editedAt,
+      currentTitle: discussion.title,
+      currentContent: discussion.content,
+    });
+  } catch (error) {
+    console.error('Get history error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
@@ -486,9 +555,11 @@ app.post('/api/discussions', authMiddleware, async (req, res) => {
       },
       duration,
       expiresAt,
-      stanceStats: { pro: 0, con: 0, neutral: 0 }
+      stanceStats: { pro: 0, con: 0, neutral: 0 },
+      editHistory: [],
+      editsCount: 0,
     });
-    await User.findByIdAndUpdate(user._id, { $inc: { reputation: 10 } });
+    await updateAuthorReputation(user._id, REPUTATION_REWARDS.CREATE_DISCUSSION);
     res.status(201).json({ 
       success: true, 
       discussion: Object.assign({}, newDiscussion.toObject(), { 
@@ -498,6 +569,95 @@ app.post('/api/discussions', authMiddleware, async (req, res) => {
     });
   } catch (error) {
     console.error('Create discussion error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.patch('/api/discussions/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const discussion = await Discussion.findById(req.params.id);
+    if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
+    
+    const userId = req.user.userId;
+    const isOwner = discussion.author._id.toString() === userId;
+    const currentUser = await User.findById(userId);
+    const isAdmin = currentUser && (currentUser.role === 'admin' || currentUser.role === 'moderator');
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ success: false, message: 'غير مسموح بتعديل هذا النقاش' });
+    }
+    
+    const newTitle = req.body.title !== undefined ? sanitizeString(req.body.title, 200) : null;
+    const newContent = req.body.content !== undefined ? sanitizeString(req.body.content, 10000) : null;
+    const reason = sanitizeString(req.body.reason || '', 200);
+    
+    if (newTitle !== null && (!newTitle || newTitle.length < 5)) {
+      return res.status(400).json({ success: false, message: 'العنوان قصير جداً' });
+    }
+    if (newContent !== null && (!newContent || newContent.length < 10)) {
+      return res.status(400).json({ success: false, message: 'المحتوى قصير جداً' });
+    }
+    
+    const titleChanged = newTitle !== null && newTitle !== discussion.title;
+    const contentChanged = newContent !== null && newContent !== discussion.content;
+    
+    if (!titleChanged && !contentChanged) {
+      return res.status(400).json({ success: false, message: 'لم يتغير شيء' });
+    }
+    
+    discussion.editHistory.push({
+      editedAt: new Date(),
+      editedBy: { _id: currentUser._id, name: currentUser.name },
+      previousTitle: discussion.title,
+      previousContent: discussion.content,
+      reason: reason,
+    });
+    
+    if (titleChanged) discussion.title = newTitle;
+    if (contentChanged) discussion.content = newContent;
+    discussion.editedAt = new Date();
+    discussion.editsCount = (discussion.editsCount || 0) + 1;
+    
+    await discussion.save();
+    
+    res.json({ 
+      success: true, 
+      discussion: Object.assign({}, discussion.toObject(), { 
+        _id: discussion._id.toString(),
+        isExpired: isDiscussionExpired(discussion)
+      }),
+      message: 'تم تعديل النقاش'
+    });
+  } catch (error) {
+    console.error('Edit discussion error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.delete('/api/discussions/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const discussion = await Discussion.findById(req.params.id);
+    if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
+    
+    const userId = req.user.userId;
+    const isOwner = discussion.author._id.toString() === userId;
+    const currentUser = await User.findById(userId);
+    const isAdmin = currentUser && (currentUser.role === 'admin' || currentUser.role === 'moderator');
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ success: false, message: 'غير مسموح بحذف هذا النقاش' });
+    }
+    
+    await Comment.deleteMany({ discussionId: req.params.id });
+    await Discussion.findByIdAndDelete(req.params.id);
+    
+    res.json({ success: true, message: 'تم حذف النقاش' });
+  } catch (error) {
+    console.error('Delete discussion error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
@@ -528,10 +688,32 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
     
     const content = sanitizeString(req.body.content, 5000);
     const stance = req.body.stance;
+    const parentCommentId = req.body.parentCommentId || null;
     
     if (!content) return res.status(400).json({ success: false, message: 'محتوى التعليق مطلوب' });
-    if (!['pro', 'con', 'neutral'].includes(stance)) {
-      return res.status(400).json({ success: false, message: 'يجب اختيار موقف (مع/ضد/محايد)' });
+    
+    let isReply = false;
+    let validParentId = null;
+    let finalStance = stance;
+    
+    if (parentCommentId) {
+      if (!mongoose.Types.ObjectId.isValid(parentCommentId)) {
+        return res.status(400).json({ success: false, message: 'معرف التعليق الأصلي غير صحيح' });
+      }
+      const parentComment = await Comment.findById(parentCommentId);
+      if (!parentComment) {
+        return res.status(404).json({ success: false, message: 'التعليق الأصلي غير موجود' });
+      }
+      if (parentComment.discussionId.toString() !== req.params.id) {
+        return res.status(400).json({ success: false, message: 'التعليق الأصلي ينتمي لنقاش مختلف' });
+      }
+      isReply = true;
+      validParentId = parentComment._id;
+      finalStance = parentComment.stance;
+    } else {
+      if (!['pro', 'con', 'neutral'].includes(stance)) {
+        return res.status(400).json({ success: false, message: 'يجب اختيار موقف (مع/ضد/محايد)' });
+      }
     }
     
     const user = await User.findById(req.user.userId);
@@ -540,7 +722,7 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
     const newComment = await Comment.create({
       discussionId: req.params.id, 
       content,
-      stance,
+      stance: finalStance,
       author: { 
         _id: user._id, 
         name: user.name, 
@@ -550,24 +732,84 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
       },
       reactions: {
         logical: [],
-        evidenced: [],
-        insightful: [],
-        clarify: [],
+        illogical: [],
+        inspiring: [],
+        unclear: [],
       },
-      qualityScore: 0
+      qualityScore: 0,
+      parentCommentId: validParentId,
+      isReply,
     });
     
-    const stanceField = `stanceStats.${stance}`;
-    await Discussion.findByIdAndUpdate(req.params.id, { 
-      $inc: { commentCount: 1, [stanceField]: 1 } 
-    });
+    if (!isReply) {
+      const stanceField = `stanceStats.${finalStance}`;
+      await Discussion.findByIdAndUpdate(req.params.id, { 
+        $inc: { commentCount: 1, [stanceField]: 1 } 
+      });
+    } else {
+      await Discussion.findByIdAndUpdate(req.params.id, { 
+        $inc: { commentCount: 1 } 
+      });
+    }
+    
+    await updateAuthorReputation(user._id, REPUTATION_REWARDS.CREATE_COMMENT);
     
     res.status(201).json({ 
       success: true, 
-      comment: Object.assign({}, newComment.toObject(), { _id: newComment._id.toString() }) 
+      comment: Object.assign({}, newComment.toObject(), { 
+        _id: newComment._id.toString(),
+        parentCommentId: validParentId ? validParentId.toString() : null,
+      }) 
     });
   } catch (error) {
     console.error('Add comment error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.patch('/api/comments/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const comment = await Comment.findById(req.params.id);
+    if (!comment) return res.status(404).json({ success: false, message: 'التعليق غير موجود' });
+    
+    const userId = req.user.userId;
+    const isOwner = comment.author._id.toString() === userId;
+    const currentUser = await User.findById(userId);
+    const isAdmin = currentUser && (currentUser.role === 'admin' || currentUser.role === 'moderator');
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ success: false, message: 'غير مسموح بتعديل هذا التعليق' });
+    }
+    
+    const discussion = await Discussion.findById(comment.discussionId);
+    if (discussion && isDiscussionExpired(discussion)) {
+      return res.status(403).json({ success: false, message: 'انتهى وقت النقاش' });
+    }
+    
+    const newContent = sanitizeString(req.body.content, 5000);
+    if (!newContent || newContent.length < 1) {
+      return res.status(400).json({ success: false, message: 'محتوى التعليق مطلوب' });
+    }
+    if (newContent === comment.content) {
+      return res.status(400).json({ success: false, message: 'لم يتغير شيء' });
+    }
+    
+    comment.content = newContent;
+    comment.editedAt = new Date();
+    await comment.save();
+    
+    res.json({ 
+      success: true, 
+      comment: Object.assign({}, comment.toObject(), { 
+        _id: comment._id.toString(),
+        parentCommentId: comment.parentCommentId ? comment.parentCommentId.toString() : null,
+      }),
+      message: 'تم تعديل التعليق'
+    });
+  } catch (error) {
+    console.error('Edit comment error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
@@ -587,8 +829,9 @@ app.post('/api/comments/:id/upvote', authMiddleware, async (req, res) => {
     
     const userId = req.user.userId;
     const upvoteIndex = comment.upvotes.indexOf(userId);
+    const isUpvoting = upvoteIndex === -1;
     
-    if (upvoteIndex === -1) {
+    if (isUpvoting) {
       comment.upvotes.push(userId);
     } else {
       comment.upvotes.splice(upvoteIndex, 1);
@@ -597,9 +840,14 @@ app.post('/api/comments/:id/upvote', authMiddleware, async (req, res) => {
     comment.qualityScore = calculateQualityScore(comment);
     await comment.save();
     
+    if (comment.author._id.toString() !== userId) {
+      const reputationChange = isUpvoting ? REPUTATION_REWARDS.RECEIVE_UPVOTE : -REPUTATION_REWARDS.RECEIVE_UPVOTE;
+      await updateAuthorReputation(comment.author._id, reputationChange);
+    }
+    
     res.json({ 
       success: true, 
-      upvoted: upvoteIndex === -1, 
+      upvoted: isUpvoting, 
       upvotesCount: comment.upvotes.length,
       qualityScore: comment.qualityScore
     });
@@ -609,6 +857,13 @@ app.post('/api/comments/:id/upvote', authMiddleware, async (req, res) => {
   }
 });
 
+const REACTION_REPUTATION_MAP = {
+  logical: 'RECEIVE_LOGICAL',
+  illogical: 'RECEIVE_ILLOGICAL',
+  inspiring: 'RECEIVE_INSPIRING',
+  unclear: 'RECEIVE_UNCLEAR',
+};
+
 app.post('/api/comments/:id/react', authMiddleware, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
@@ -616,7 +871,7 @@ app.post('/api/comments/:id/react', authMiddleware, async (req, res) => {
     }
     
     const reactionType = req.body.type;
-    const validReactions = ['logical', 'evidenced', 'insightful', 'clarify'];
+    const validReactions = ['logical', 'illogical', 'inspiring', 'unclear'];
     if (!validReactions.includes(reactionType)) {
       return res.status(400).json({ success: false, message: 'نوع التفاعل غير صحيح' });
     }
@@ -630,19 +885,50 @@ app.post('/api/comments/:id/react', authMiddleware, async (req, res) => {
     }
     
     if (!comment.reactions) {
-      comment.reactions = { logical: [], evidenced: [], insightful: [], clarify: [] };
+      comment.reactions = { logical: [], illogical: [], inspiring: [], unclear: [] };
     }
-    if (!comment.reactions[reactionType]) {
-      comment.reactions[reactionType] = [];
-    }
+    validReactions.forEach(t => {
+      if (!comment.reactions[t]) comment.reactions[t] = [];
+    });
     
     const userId = req.user.userId;
-    const reactionIndex = comment.reactions[reactionType].indexOf(userId);
+    const currentReactionIndex = comment.reactions[reactionType].indexOf(userId);
+    const isAdding = currentReactionIndex === -1;
     
-    if (reactionIndex === -1) {
+    let removedReactionType = null;
+    
+    if (isAdding) {
+      const userActiveReactions = validReactions.filter(t => 
+        comment.reactions[t].includes(userId)
+      );
+      
+      if (userActiveReactions.length >= MAX_REACTIONS_PER_USER) {
+        const oldestType = userActiveReactions[0];
+        const idx = comment.reactions[oldestType].indexOf(userId);
+        if (idx !== -1) {
+          comment.reactions[oldestType].splice(idx, 1);
+          removedReactionType = oldestType;
+          
+          if (comment.author._id.toString() !== userId) {
+            const oldKey = REACTION_REPUTATION_MAP[oldestType];
+            await updateAuthorReputation(comment.author._id, -REPUTATION_REWARDS[oldKey]);
+          }
+        }
+      }
+      
       comment.reactions[reactionType].push(userId);
+      
+      if (comment.author._id.toString() !== userId) {
+        const newKey = REACTION_REPUTATION_MAP[reactionType];
+        await updateAuthorReputation(comment.author._id, REPUTATION_REWARDS[newKey]);
+      }
     } else {
-      comment.reactions[reactionType].splice(reactionIndex, 1);
+      comment.reactions[reactionType].splice(currentReactionIndex, 1);
+      
+      if (comment.author._id.toString() !== userId) {
+        const removedKey = REACTION_REPUTATION_MAP[reactionType];
+        await updateAuthorReputation(comment.author._id, -REPUTATION_REWARDS[removedKey]);
+      }
     }
     
     comment.qualityScore = calculateQualityScore(comment);
@@ -652,12 +938,13 @@ app.post('/api/comments/:id/react', authMiddleware, async (req, res) => {
     res.json({ 
       success: true, 
       reactionType,
-      active: reactionIndex === -1,
+      active: isAdding,
+      removedReactionType,
       counts: {
         logical: comment.reactions.logical.length,
-        evidenced: comment.reactions.evidenced.length,
-        insightful: comment.reactions.insightful.length,
-        clarify: comment.reactions.clarify.length,
+        illogical: comment.reactions.illogical.length,
+        inspiring: comment.reactions.inspiring.length,
+        unclear: comment.reactions.unclear.length,
       },
       qualityScore: comment.qualityScore
     });
@@ -686,12 +973,24 @@ app.delete('/api/comments/:id', authMiddleware, async (req, res) => {
     
     const discussionId = comment.discussionId;
     const stance = comment.stance;
-    const stanceField = `stanceStats.${stance}`;
+    const isReply = comment.isReply;
     
+    await Comment.deleteMany({ parentCommentId: comment._id });
     await Comment.findByIdAndDelete(req.params.id);
-    await Discussion.findByIdAndUpdate(discussionId, { 
-      $inc: { commentCount: -1, [stanceField]: -1 } 
-    });
+    
+    const repliesDeletedCount = await Comment.countDocuments({ parentCommentId: comment._id });
+    const totalDeleted = 1 + repliesDeletedCount;
+    
+    if (!isReply) {
+      const stanceField = `stanceStats.${stance}`;
+      await Discussion.findByIdAndUpdate(discussionId, { 
+        $inc: { commentCount: -totalDeleted, [stanceField]: -1 } 
+      });
+    } else {
+      await Discussion.findByIdAndUpdate(discussionId, { 
+        $inc: { commentCount: -totalDeleted } 
+      });
+    }
     
     res.json({ success: true, message: 'تم حذف التعليق' });
   } catch (error) {
