@@ -1264,6 +1264,30 @@ app.get('/api/search', async (req, res) => {
     res.status(500).json({ success: false, message: 'خطأ في البحث' });
   }
 });
+// Delete legacy/test circles (admin only)
+app.get('/api/admin/cleanup-circles', async (req, res) => {
+  try {
+    const adminKey = req.query.key;
+    if (adminKey !== 'aporia-cleanup-2026') {
+      return res.status(403).json({ success: false, message: 'غير مصرح' });
+    }
+    
+    // Delete circles with non-emoji icons (legacy data)
+    const legacyIcons = ['Brain', 'Scale', 'Cpu', 'TrendingUp', 'Heart', 'BookOpen', 'Lightbulb', 'Globe2'];
+    const result = await Circle.deleteMany({ 
+      icon: { $in: legacyIcons } 
+    });
+    
+    res.json({ 
+      success: true, 
+      deletedCount: result.deletedCount,
+      message: `تم حذف ${result.deletedCount} دائرة قديمة`
+    });
+  } catch (error) {
+    console.error('Cleanup error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
 app.get('/api/admin/seed-circles', async (req, res) => {
   try {
     const adminKey = req.query.key;
