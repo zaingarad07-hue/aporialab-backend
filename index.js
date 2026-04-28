@@ -189,7 +189,21 @@ const CircleSchema = new mongoose.Schema({
   isPrivate: { type: Boolean, default: false },
   icon: String,
   color: String,
+  bannerColor: String,
+  tags: [{ type: String }],
   memberIds: [{ type: String }],
+  pendingRequests: [{ 
+    userId: String,
+    userName: String,
+    userAvatar: String,
+    requestedAt: { type: Date, default: Date.now },
+    message: String,
+  }],
+  discussionCount: { type: Number, default: 0 },
+  createdBy: {
+    _id: String,
+    name: String,
+  },
 }, { timestamps: true });
 
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
@@ -267,7 +281,7 @@ function authMiddleware(req, res, next) {
 
 app.get('/', (req, res) => res.json({ 
   name: 'AporiaLab API', 
-  version: '4.0.0', 
+  version: '4.1.0', 
   status: 'running', 
   database: 'MongoDB', 
   security: 'enhanced', 
@@ -1025,11 +1039,99 @@ app.post('/api/circles/:id/join', authMiddleware, async (req, res) => {
     const circle = await Circle.findById(req.params.id);
     if (!circle) return res.status(404).json({ success: false, message: 'الدائرة غير موجودة' });
     const userId = req.user.userId;
+    const user = await User.findById(userId).select('name avatar').lean();
     const memberIndex = circle.memberIds.indexOf(userId);
-    if (memberIndex === -1) { circle.memberIds.push(userId); circle.members += 1; }
-    else { circle.memberIds.splice(memberIndex, 1); circle.members = Math.max(0, circle.members - 1); }
+    
+    // If already a member, leave the circle
+    if (memberIndex !== -1) {
+      circle.memberIds.splice(memberIndex, 1);
+      circle.members = Math.max(0, circle.members - 1);
+      await circle.save();
+      return res.json({ success: true, joined: false, members: circle.members });
+    }
+    
+    // For private circles, add to pendingRequests instead of memberIds
+    if (circle.isPrivate) {
+      const alreadyPending = circle.pendingRequests.some(r => r.userId === userId);
+      if (alreadyPending) {
+        return res.json({ success: true, status: 'pending', message: 'طلبك قيد المراجعة' });
+      }
+      circle.pendingRequests.push({
+        userId: userId,
+        userName: user ? user.name : 'مستخدم',
+        userAvatar: user ? user.avatar : '',
+        requestedAt: new Date(),
+        message: req.body.message || '',
+      });
+      await circle.save();
+      return res.json({ success: true, status: 'pending', message: 'تم إرسال طلب الانضمام' });
+    }
+    
+    // For public circles, add directly
+    circle.memberIds.push(userId);
+    circle.members += 1;
     await circle.save();
-    res.json({ success: true, joined: memberIndex === -1, members: circle.members });
+    res.json({ success: true, joined: true, members: circle.members });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+// Approve a pending request (admin/owner only)
+app.post('/api/circles/:id/approve/:userId', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    const circle = await Circle.findById(req.params.id);
+    if (!circle) return res.status(404).json({ success: false, message: 'الدائرة غير موجودة' });
+    
+    // Only admin or circle creator can approve
+    const user = await User.findById(req.user.userId);
+    const isAdmin = user && (user.role === 'admin' || user.role === 'moderator');
+    const isCreator = circle.createdBy && circle.createdBy._id === req.user.userId;
+    if (!isAdmin && !isCreator) {
+      return res.status(403).json({ success: false, message: 'لا تملك صلاحية الموافقة' });
+    }
+    
+    const pendingIndex = circle.pendingRequests.findIndex(r => r.userId === req.params.userId);
+    if (pendingIndex === -1) {
+      return res.status(404).json({ success: false, message: 'طلب غير موجود' });
+    }
+    
+    // Move from pending to members
+    circle.pendingRequests.splice(pendingIndex, 1);
+    if (!circle.memberIds.includes(req.params.userId)) {
+      circle.memberIds.push(req.params.userId);
+      circle.members += 1;
+    }
+    await circle.save();
+    res.json({ success: true, message: 'تمت الموافقة' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+// Reject a pending request
+app.post('/api/circles/:id/reject/:userId', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    const circle = await Circle.findById(req.params.id);
+    if (!circle) return res.status(404).json({ success: false, message: 'الدائرة غير موجودة' });
+    
+    const user = await User.findById(req.user.userId);
+    const isAdmin = user && (user.role === 'admin' || user.role === 'moderator');
+    const isCreator = circle.createdBy && circle.createdBy._id === req.user.userId;
+    if (!isAdmin && !isCreator) {
+      return res.status(403).json({ success: false, message: 'لا تملك صلاحية الرفض' });
+    }
+    
+    const pendingIndex = circle.pendingRequests.findIndex(r => r.userId === req.params.userId);
+    if (pendingIndex === -1) {
+      return res.status(404).json({ success: false, message: 'طلب غير موجود' });
+    }
+    
+    circle.pendingRequests.splice(pendingIndex, 1);
+    await circle.save();
+    res.json({ success: true, message: 'تم الرفض' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -1160,6 +1262,122 @@ app.get('/api/search', async (req, res) => {
   } catch (error) {
     console.error('Search error:', error);
     res.status(500).json({ success: false, message: 'خطأ في البحث' });
+  }
+});
+app.get('/api/admin/seed-circles', async (req, res) => {
+  try {
+    const adminKey = req.query.key;
+    if (adminKey !== 'aporia-seed-2026') {
+      return res.status(403).json({ success: false, message: 'غير مصرح' });
+    }
+    
+    const CIRCLES_DATA = [
+      {
+        name: 'الفلسفة الإغريقية',
+        description: 'دراسة فلاسفة اليونان: سقراط، أفلاطون، أرسطو، والحكماء قبلهم',
+        category: 'philosophy',
+        icon: '🏛️',
+        color: '#3b82f6',
+        bannerColor: 'from-blue-500/20 to-blue-700/10',
+        tags: ['سقراط', 'أفلاطون', 'أرسطو', 'فلسفة قديمة'],
+        isPrivate: false,
+      },
+      {
+        name: 'الفلسفة الإسلامية',
+        description: 'تراث الكندي والفارابي وابن سينا وابن رشد والغزالي',
+        category: 'philosophy',
+        icon: '🌙',
+        color: '#10b981',
+        bannerColor: 'from-emerald-500/20 to-emerald-700/10',
+        tags: ['ابن رشد', 'ابن سينا', 'الفارابي', 'الغزالي'],
+        isPrivate: false,
+      },
+      {
+        name: 'فلسفة العقل',
+        description: 'الوعي، الإدراك، الذكاء الاصطناعي، وطبيعة الفكر',
+        category: 'philosophy',
+        icon: '🧠',
+        color: '#8b5cf6',
+        bannerColor: 'from-purple-500/20 to-purple-700/10',
+        tags: ['وعي', 'ذكاء اصطناعي', 'إدراك', 'علم النفس'],
+        isPrivate: false,
+      },
+      {
+        name: 'الأخلاق المعاصرة',
+        description: 'الأخلاق التطبيقية، البيوإثيقا، أخلاقيات التكنولوجيا',
+        category: 'ethics',
+        icon: '⚖️',
+        color: '#f59e0b',
+        bannerColor: 'from-amber-500/20 to-amber-700/10',
+        tags: ['أخلاق', 'بيوإثيقا', 'تكنولوجيا', 'مجتمع'],
+        isPrivate: false,
+      },
+      {
+        name: 'فلسفة السياسة',
+        description: 'العدالة، الحرية، الديمقراطية، والنظم السياسية',
+        category: 'politics',
+        icon: '🌍',
+        color: '#ef4444',
+        bannerColor: 'from-red-500/20 to-red-700/10',
+        tags: ['عدالة', 'حرية', 'ديمقراطية', 'دولة'],
+        isPrivate: false,
+      },
+      {
+        name: 'فلسفة العلم',
+        description: 'المنهج العلمي، الإبستمولوجيا، تاريخ العلوم',
+        category: 'science',
+        icon: '🔬',
+        color: '#06b6d4',
+        bannerColor: 'from-cyan-500/20 to-cyan-700/10',
+        tags: ['علم', 'منهج', 'إبستمولوجيا', 'معرفة'],
+        isPrivate: false,
+      },
+      {
+        name: 'فلسفة الفن والجمال',
+        description: 'الإستطيقا، النقد الفني، فلسفة الإبداع',
+        category: 'aesthetics',
+        icon: '🎨',
+        color: '#ec4899',
+        bannerColor: 'from-pink-500/20 to-pink-700/10',
+        tags: ['فن', 'جمال', 'إبداع', 'نقد'],
+        isPrivate: false,
+      },
+      {
+        name: 'الوجودية والحياة',
+        description: 'كيركغارد، نيتشه، سارتر، كامو، ومعنى الوجود',
+        category: 'existentialism',
+        icon: '🕊️',
+        color: '#64748b',
+        bannerColor: 'from-slate-500/20 to-slate-700/10',
+        tags: ['وجودية', 'نيتشه', 'سارتر', 'معنى'],
+        isPrivate: false,
+      },
+    ];
+    
+    const results = { created: [], existed: [] };
+    
+    for (const circleData of CIRCLES_DATA) {
+      const existing = await Circle.findOne({ name: circleData.name });
+      if (existing) {
+        results.existed.push(circleData.name);
+      } else {
+        const newCircle = new Circle({
+          ...circleData,
+          members: 0,
+          memberIds: [],
+          pendingRequests: [],
+          discussionCount: 0,
+          createdBy: { _id: 'system', name: 'AporiaLab' },
+        });
+        await newCircle.save();
+        results.created.push(circleData.name);
+      }
+    }
+    
+    res.json({ success: true, results });
+  } catch (error) {
+    console.error('Seed circles error:', error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
