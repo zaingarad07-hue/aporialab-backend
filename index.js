@@ -12,8 +12,20 @@ const app = express();
 app.set('trust proxy', 1);
 
 app.use(helmet({
-  contentSecurityPolicy: false,
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      defaultSrc: ["'self'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      connectSrc: ["'self'", 'https:'],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+    },
+  },
   crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 
 const allowedOrigins = [
@@ -214,6 +226,19 @@ const CircleSchema = new mongoose.Schema({
     name: String,
   },
 }, { timestamps: true });
+
+DiscussionSchema.index({ createdAt: -1 });
+DiscussionSchema.index({ views: -1, createdAt: -1 });
+DiscussionSchema.index({ category: 1, createdAt: -1 });
+DiscussionSchema.index({ 'author._id': 1, createdAt: -1 });
+DiscussionSchema.index({ expiresAt: 1 });
+DiscussionSchema.index({ title: 'text', content: 'text', tags: 'text' });
+
+CommentSchema.index({ discussionId: 1, qualityScore: -1, createdAt: -1 });
+CommentSchema.index({ parentCommentId: 1 });
+CommentSchema.index({ 'author._id': 1, createdAt: -1 });
+
+UserSchema.index({ reputation: -1 });
 
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 const Discussion = mongoose.models.Discussion || mongoose.model('Discussion', DiscussionSchema);
@@ -519,11 +544,20 @@ app.get('/api/discussions/:id', async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const discussion = await Discussion.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } }, { new: true }).lean();
     if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
-    
-    const comments = await Comment.find({ discussionId: req.params.id })
-      .sort({ qualityScore: -1, createdAt: -1 })
-      .lean();
-    
+
+    const commentsPage = Math.max(1, parseInt(req.query.commentsPage) || 1);
+    const commentsLimit = Math.min(100, Math.max(5, parseInt(req.query.commentsLimit) || 50));
+    const commentsSkip = (commentsPage - 1) * commentsLimit;
+
+    const [totalComments, comments] = await Promise.all([
+      Comment.countDocuments({ discussionId: req.params.id }),
+      Comment.find({ discussionId: req.params.id })
+        .sort({ qualityScore: -1, createdAt: -1 })
+        .skip(commentsSkip)
+        .limit(commentsLimit)
+        .lean(),
+    ]);
+
     const enrichedComments = comments.map(c => ({
       ...c,
       _id: c._id.toString(),
@@ -535,14 +569,20 @@ app.get('/api/discussions/:id', async (req, res) => {
         unclear: c.reactions?.unclear || [],
       }
     }));
-    
-    res.json({ 
-      success: true, 
-      discussion: Object.assign({}, discussion, { 
-        _id: discussion._id.toString(), 
+
+    res.json({
+      success: true,
+      discussion: Object.assign({}, discussion, {
+        _id: discussion._id.toString(),
         comments: enrichedComments,
         isExpired: isDiscussionExpired(discussion)
-      }) 
+      }),
+      commentsPagination: {
+        page: commentsPage,
+        limit: commentsLimit,
+        total: totalComments,
+        pages: Math.ceil(totalComments / commentsLimit),
+      },
     });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
