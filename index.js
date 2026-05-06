@@ -24,11 +24,16 @@ const allowedOrigins = [
   'http://localhost:3000',
 ];
 
+const extraOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+const allowedOriginsSet = new Set([...allowedOrigins, ...extraOrigins]);
+
 const corsOptions = {
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
-    if (origin.endsWith('.vercel.app')) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
+    if (allowedOriginsSet.has(origin)) return callback(null, true);
     return callback(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
@@ -69,9 +74,13 @@ const googleAuthLimiter = rateLimit({
 
 app.use('/api/', generalLimiter);
 
-const JWT_SECRET = process.env.JWT_SECRET || 'aporialab-secret-key-2026';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET environment variable is required');
+}
 const MONGODB_URI = process.env.MONGODB_URI;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
@@ -276,6 +285,26 @@ function authMiddleware(req, res, next) {
     next();
   } catch (e) {
     return res.status(401).json({ success: false, message: 'جلسة منتهية - يرجى تسجيل الدخول مجدداً' });
+  }
+}
+
+async function adminMiddleware(req, res, next) {
+  try {
+    if (!ADMIN_KEY) {
+      return res.status(503).json({ success: false, message: 'وظائف الإدارة غير مفعّلة' });
+    }
+    const providedKey = req.headers['x-admin-key'];
+    if (!providedKey || providedKey !== ADMIN_KEY) {
+      return res.status(403).json({ success: false, message: 'غير مصرح' });
+    }
+    const user = await User.findById(req.user.userId);
+    if (!user || user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'صلاحيات الإدارة مطلوبة' });
+    }
+    req.adminUser = user;
+    next();
+  } catch (e) {
+    return res.status(500).json({ success: false, message: 'خطأ في التحقق من صلاحيات الإدارة' });
   }
 }
 
@@ -988,12 +1017,11 @@ app.delete('/api/comments/:id', authMiddleware, async (req, res) => {
     const discussionId = comment.discussionId;
     const stance = comment.stance;
     const isReply = comment.isReply;
-    
-    await Comment.deleteMany({ parentCommentId: comment._id });
+
+    const repliesResult = await Comment.deleteMany({ parentCommentId: comment._id });
     await Comment.findByIdAndDelete(req.params.id);
-    
-    const repliesDeletedCount = await Comment.countDocuments({ parentCommentId: comment._id });
-    const totalDeleted = 1 + repliesDeletedCount;
+
+    const totalDeleted = 1 + (repliesResult.deletedCount || 0);
     
     if (!isReply) {
       const stanceField = `stanceStats.${stance}`;
@@ -1265,21 +1293,16 @@ app.get('/api/search', async (req, res) => {
   }
 });
 // Delete legacy/test circles (admin only)
-app.get('/api/admin/cleanup-circles', async (req, res) => {
+app.post('/api/admin/cleanup-circles', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const adminKey = req.query.key;
-    if (adminKey !== 'aporia-cleanup-2026') {
-      return res.status(403).json({ success: false, message: 'غير مصرح' });
-    }
-    
     // Delete circles with non-emoji icons (legacy data)
     const legacyIcons = ['Brain', 'Scale', 'Cpu', 'TrendingUp', 'Heart', 'BookOpen', 'Lightbulb', 'Globe2'];
-    const result = await Circle.deleteMany({ 
-      icon: { $in: legacyIcons } 
+    const result = await Circle.deleteMany({
+      icon: { $in: legacyIcons }
     });
-    
-    res.json({ 
-      success: true, 
+
+    res.json({
+      success: true,
       deletedCount: result.deletedCount,
       message: `تم حذف ${result.deletedCount} دائرة قديمة`
     });
@@ -1288,13 +1311,8 @@ app.get('/api/admin/cleanup-circles', async (req, res) => {
     res.status(500).json({ success: false, message: error.message });
   }
 });
-app.get('/api/admin/seed-circles', async (req, res) => {
+app.post('/api/admin/seed-circles', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const adminKey = req.query.key;
-    if (adminKey !== 'aporia-seed-2026') {
-      return res.status(403).json({ success: false, message: 'غير مصرح' });
-    }
-    
     const CIRCLES_DATA = [
       {
         name: 'الفلسفة الإغريقية',
@@ -1405,13 +1423,8 @@ app.get('/api/admin/seed-circles', async (req, res) => {
   }
 });
 
-app.get('/api/admin/reset-founders', async (req, res) => {
+app.post('/api/admin/reset-founders', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const key = req.query.key || '';
-    if (key !== 'aporialab2026') {
-      return res.status(403).json({ success: false, message: 'غير مصرح' });
-    }
-
     const foundingPhilosophers = [
       { name: 'Ibn Rushd', email: 'ibn.rushd@aporialab.space', bio: 'Andalusian philosopher (Averroes). Commentator on Aristotle. Champion of rationalism.', reputation: 300, role: 'moderator', seed: 'ibnrushd' },
       { name: 'Al-Kindi', email: 'alkindi@aporialab.space', bio: 'First of the Arab philosophers. Pioneer in philosophy of science, mathematics, and cryptography.', reputation: 250, role: 'user', seed: 'alkindi' },
@@ -1452,13 +1465,8 @@ app.get('/api/admin/reset-founders', async (req, res) => {
   }
 });
 
-app.get('/api/admin/cleanup-non-founders', async (req, res) => {
+app.post('/api/admin/cleanup-non-founders', authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const key = req.query.key || '';
-    if (key !== 'aporialab2026') {
-      return res.status(403).json({ success: false, message: 'غير مصرح' });
-    }
-
     const nonFounders = await User.find({ isFoundingMember: { $ne: true } }).select('_id name email');
     const userIds = nonFounders.map(u => u._id);
     const userInfo = nonFounders.map(u => ({ name: u.name, email: u.email }));
