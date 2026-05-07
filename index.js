@@ -227,6 +227,33 @@ const CircleSchema = new mongoose.Schema({
   },
 }, { timestamps: true });
 
+const NOTIFICATION_TYPES = [
+  'comment',
+  'reply',
+  'discussion_upvote',
+  'comment_upvote',
+  'reaction_logical',
+  'reaction_inspiring',
+  'circle_join_request',
+  'circle_approved',
+  'circle_rejected',
+];
+
+const NotificationSchema = new mongoose.Schema({
+  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  sender: {
+    _id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    name: String,
+    avatar: String,
+  },
+  type: { type: String, enum: NOTIFICATION_TYPES, required: true },
+  title: { type: String, required: true, maxlength: 200 },
+  message: { type: String, default: '', maxlength: 500 },
+  link: { type: String, default: '', maxlength: 300 },
+  metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
+  isRead: { type: Boolean, default: false, index: true },
+}, { timestamps: true });
+
 DiscussionSchema.index({ createdAt: -1 });
 DiscussionSchema.index({ views: -1, createdAt: -1 });
 DiscussionSchema.index({ category: 1, createdAt: -1 });
@@ -240,10 +267,42 @@ CommentSchema.index({ 'author._id': 1, createdAt: -1 });
 
 UserSchema.index({ reputation: -1 });
 
+NotificationSchema.index({ recipient: 1, isRead: 1, createdAt: -1 });
+NotificationSchema.index({ recipient: 1, type: 1, createdAt: -1 });
+NotificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 60 });
+
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 const Discussion = mongoose.models.Discussion || mongoose.model('Discussion', DiscussionSchema);
 const Comment = mongoose.models.Comment || mongoose.model('Comment', CommentSchema);
 const Circle = mongoose.models.Circle || mongoose.model('Circle', CircleSchema);
+const Notification = mongoose.models.Notification || mongoose.model('Notification', NotificationSchema);
+
+async function createNotification({ recipient, sender, type, title, message, link, metadata }) {
+  if (!recipient) return null;
+  const recipientId = recipient.toString();
+  const senderId = sender && sender._id ? sender._id.toString() : null;
+  if (senderId && senderId === recipientId) return null;
+  try {
+    const doc = await Notification.create({
+      recipient: recipientId,
+      sender: sender ? {
+        _id: sender._id || null,
+        name: sender.name || '',
+        avatar: sender.avatar || '',
+      } : undefined,
+      type,
+      title: title || '',
+      message: message || '',
+      link: link || '',
+      metadata: metadata || {},
+      isRead: false,
+    });
+    return doc;
+  } catch (e) {
+    console.error('createNotification failed:', e.message);
+    return null;
+  }
+}
 
 function sanitizeString(str, maxLen) {
   if (typeof str !== 'string') return '';
@@ -753,10 +812,25 @@ app.post('/api/discussions/:id/like', authMiddleware, async (req, res) => {
     if (isDiscussionExpired(discussion)) return res.status(403).json({ success: false, message: 'انتهى وقت النقاش' });
     const userId = req.user.userId;
     const likeIndex = discussion.upvotes.indexOf(userId);
-    if (likeIndex === -1) discussion.upvotes.push(userId);
+    const isLiking = likeIndex === -1;
+    if (isLiking) discussion.upvotes.push(userId);
     else discussion.upvotes.splice(likeIndex, 1);
     await discussion.save();
-    res.json({ success: true, liked: likeIndex === -1, upvotesCount: discussion.upvotes.length });
+
+    if (isLiking && discussion.author && discussion.author._id) {
+      const sender = await User.findById(userId).select('name avatar').lean();
+      await createNotification({
+        recipient: discussion.author._id,
+        sender: sender ? { _id: userId, name: sender.name, avatar: sender.avatar } : { _id: userId },
+        type: 'discussion_upvote',
+        title: 'إعجاب جديد بنقاشك',
+        message: discussion.title,
+        link: '/discussion/' + discussion._id.toString(),
+        metadata: { discussionId: discussion._id.toString() },
+      });
+    }
+
+    res.json({ success: true, liked: isLiking, upvotesCount: discussion.upvotes.length });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
@@ -778,7 +852,8 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
     let isReply = false;
     let validParentId = null;
     let finalStance = stance;
-    
+    let parentAuthorId = null;
+
     if (parentCommentId) {
       if (!mongoose.Types.ObjectId.isValid(parentCommentId)) {
         return res.status(400).json({ success: false, message: 'معرف التعليق الأصلي غير صحيح' });
@@ -793,6 +868,7 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
       isReply = true;
       validParentId = parentComment._id;
       finalStance = parentComment.stance;
+      parentAuthorId = parentComment.author && parentComment.author._id ? parentComment.author._id : null;
     } else {
       if (!['pro', 'con', 'neutral'].includes(stance)) {
         return res.status(400).json({ success: false, message: 'يجب اختيار موقف (مع/ضد/محايد)' });
@@ -836,13 +912,44 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
     }
     
     await updateAuthorReputation(user._id, REPUTATION_REWARDS.CREATE_COMMENT);
-    
-    res.status(201).json({ 
-      success: true, 
-      comment: Object.assign({}, newComment.toObject(), { 
+
+    const senderInfo = { _id: user._id, name: user.name, avatar: user.avatar };
+    const commentLink = '/discussion/' + req.params.id + '#c-' + newComment._id.toString();
+    if (isReply && parentAuthorId) {
+      await createNotification({
+        recipient: parentAuthorId,
+        sender: senderInfo,
+        type: 'reply',
+        title: 'ردّ جديد على تعليقك',
+        message: content.slice(0, 200),
+        link: commentLink,
+        metadata: {
+          discussionId: req.params.id,
+          commentId: newComment._id.toString(),
+          parentCommentId: validParentId ? validParentId.toString() : null,
+        },
+      });
+    } else if (!isReply && discussion.author && discussion.author._id) {
+      await createNotification({
+        recipient: discussion.author._id,
+        sender: senderInfo,
+        type: 'comment',
+        title: 'تعليق جديد على نقاشك',
+        message: content.slice(0, 200),
+        link: commentLink,
+        metadata: {
+          discussionId: req.params.id,
+          commentId: newComment._id.toString(),
+        },
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      comment: Object.assign({}, newComment.toObject(), {
         _id: newComment._id.toString(),
         parentCommentId: validParentId ? validParentId.toString() : null,
-      }) 
+      })
     });
   } catch (error) {
     console.error('Add comment error:', error);
@@ -927,9 +1034,25 @@ app.post('/api/comments/:id/upvote', authMiddleware, async (req, res) => {
       const reputationChange = isUpvoting ? REPUTATION_REWARDS.RECEIVE_UPVOTE : -REPUTATION_REWARDS.RECEIVE_UPVOTE;
       await updateAuthorReputation(comment.author._id, reputationChange);
     }
-    
-    res.json({ 
-      success: true, 
+
+    if (isUpvoting && comment.author && comment.author._id) {
+      const sender = await User.findById(userId).select('name avatar').lean();
+      await createNotification({
+        recipient: comment.author._id,
+        sender: sender ? { _id: userId, name: sender.name, avatar: sender.avatar } : { _id: userId },
+        type: 'comment_upvote',
+        title: 'إعجاب جديد بتعليقك',
+        message: (comment.content || '').slice(0, 200),
+        link: '/discussion/' + comment.discussionId.toString() + '#c-' + comment._id.toString(),
+        metadata: {
+          discussionId: comment.discussionId.toString(),
+          commentId: comment._id.toString(),
+        },
+      });
+    }
+
+    res.json({
+      success: true,
       upvoted: isUpvoting, 
       upvotesCount: comment.upvotes.length,
       qualityScore: comment.qualityScore
@@ -1017,9 +1140,30 @@ app.post('/api/comments/:id/react', authMiddleware, async (req, res) => {
     comment.qualityScore = calculateQualityScore(comment);
     comment.markModified('reactions');
     await comment.save();
-    
-    res.json({ 
-      success: true, 
+
+    if (isAdding && (reactionType === 'logical' || reactionType === 'inspiring') && comment.author && comment.author._id) {
+      const sender = await User.findById(userId).select('name avatar').lean();
+      const reactionTitles = {
+        logical: 'تعليقك وُصف بالمنطقي',
+        inspiring: 'تعليقك وُصف بالملهم',
+      };
+      await createNotification({
+        recipient: comment.author._id,
+        sender: sender ? { _id: userId, name: sender.name, avatar: sender.avatar } : { _id: userId },
+        type: 'reaction_' + reactionType,
+        title: reactionTitles[reactionType],
+        message: (comment.content || '').slice(0, 200),
+        link: '/discussion/' + comment.discussionId.toString() + '#c-' + comment._id.toString(),
+        metadata: {
+          discussionId: comment.discussionId.toString(),
+          commentId: comment._id.toString(),
+          reactionType,
+        },
+      });
+    }
+
+    res.json({
+      success: true,
       reactionType,
       active: isAdding,
       removedReactionType,
@@ -1132,6 +1276,22 @@ app.post('/api/circles/:id/join', authMiddleware, async (req, res) => {
         message: req.body.message || '',
       });
       await circle.save();
+
+      if (circle.createdBy && circle.createdBy._id && mongoose.Types.ObjectId.isValid(circle.createdBy._id)) {
+        await createNotification({
+          recipient: circle.createdBy._id,
+          sender: { _id: userId, name: user ? user.name : '', avatar: user ? user.avatar : '' },
+          type: 'circle_join_request',
+          title: 'طلب انضمام جديد لدائرتك',
+          message: (user ? user.name : 'مستخدم') + ' يطلب الانضمام إلى ' + circle.name,
+          link: '/circles/' + circle._id.toString(),
+          metadata: {
+            circleId: circle._id.toString(),
+            requesterId: userId,
+          },
+        });
+      }
+
       return res.json({ success: true, status: 'pending', message: 'تم إرسال طلب الانضمام' });
     }
     
@@ -1172,6 +1332,19 @@ app.post('/api/circles/:id/approve/:userId', authMiddleware, async (req, res) =>
       circle.members += 1;
     }
     await circle.save();
+
+    if (mongoose.Types.ObjectId.isValid(req.params.userId)) {
+      await createNotification({
+        recipient: req.params.userId,
+        sender: { _id: req.user.userId, name: user ? user.name : '', avatar: user ? user.avatar : '' },
+        type: 'circle_approved',
+        title: 'تمت الموافقة على طلبك',
+        message: 'مرحباً بك في ' + circle.name,
+        link: '/circles/' + circle._id.toString(),
+        metadata: { circleId: circle._id.toString() },
+      });
+    }
+
     res.json({ success: true, message: 'تمت الموافقة' });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
@@ -1196,11 +1369,139 @@ app.post('/api/circles/:id/reject/:userId', authMiddleware, async (req, res) => 
     if (pendingIndex === -1) {
       return res.status(404).json({ success: false, message: 'طلب غير موجود' });
     }
-    
+
     circle.pendingRequests.splice(pendingIndex, 1);
     await circle.save();
+
+    if (mongoose.Types.ObjectId.isValid(req.params.userId)) {
+      await createNotification({
+        recipient: req.params.userId,
+        sender: { _id: req.user.userId, name: user ? user.name : '', avatar: user ? user.avatar : '' },
+        type: 'circle_rejected',
+        title: 'تحديث بشأن طلب انضمامك',
+        message: 'لم تُقبل طلبك في "' + circle.name + '" حالياً، نتمنى لك مشاركة في دوائر أخرى',
+        link: '/circles',
+        metadata: { circleId: circle._id.toString() },
+      });
+    }
+
     res.json({ success: true, message: 'تم الرفض' });
   } catch (error) {
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/notifications', authMiddleware, async (req, res) => {
+  try {
+    const filter = (req.query.filter || 'all').toString();
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+
+    const query = { recipient: req.user.userId };
+    if (filter === 'unread') {
+      query.isRead = false;
+    } else if (filter === 'comment') {
+      query.type = { $in: ['comment', 'reply'] };
+    } else if (filter === 'reply') {
+      query.type = 'reply';
+    } else if (filter === 'upvote') {
+      query.type = { $in: ['discussion_upvote', 'comment_upvote'] };
+    } else if (filter === 'reaction') {
+      query.type = { $in: ['reaction_logical', 'reaction_inspiring'] };
+    } else if (filter === 'circle') {
+      query.type = { $in: ['circle_join_request', 'circle_approved', 'circle_rejected'] };
+    }
+
+    const [total, notifications, unreadCount] = await Promise.all([
+      Notification.countDocuments(query),
+      Notification.find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      Notification.countDocuments({ recipient: req.user.userId, isRead: false }),
+    ]);
+
+    res.json({
+      success: true,
+      notifications: notifications.map(n => Object.assign({}, n, {
+        _id: n._id.toString(),
+        recipient: n.recipient ? n.recipient.toString() : null,
+        sender: n.sender ? Object.assign({}, n.sender, {
+          _id: n.sender._id ? n.sender._id.toString() : null,
+        }) : null,
+      })),
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+      unreadCount,
+    });
+  } catch (error) {
+    console.error('List notifications error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/notifications/unread-count', authMiddleware, async (req, res) => {
+  try {
+    const count = await Notification.countDocuments({ recipient: req.user.userId, isRead: false });
+    res.json({ success: true, count });
+  } catch (error) {
+    console.error('Unread count error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.patch('/api/notifications/read-all', authMiddleware, async (req, res) => {
+  try {
+    const result = await Notification.updateMany(
+      { recipient: req.user.userId, isRead: false },
+      { $set: { isRead: true } }
+    );
+    res.json({ success: true, modifiedCount: result.modifiedCount || 0 });
+  } catch (error) {
+    console.error('Read-all notifications error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.patch('/api/notifications/:id/read', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const notification = await Notification.findById(req.params.id);
+    if (!notification) {
+      return res.status(404).json({ success: false, message: 'الإشعار غير موجود' });
+    }
+    if (notification.recipient.toString() !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'غير مصرح' });
+    }
+    if (!notification.isRead) {
+      notification.isRead = true;
+      await notification.save();
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Mark notification read error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.delete('/api/notifications/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const notification = await Notification.findById(req.params.id);
+    if (!notification) {
+      return res.status(404).json({ success: false, message: 'الإشعار غير موجود' });
+    }
+    if (notification.recipient.toString() !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'غير مصرح' });
+    }
+    await Notification.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete notification error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
