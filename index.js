@@ -141,6 +141,8 @@ const UserSchema = new mongoose.Schema({
   emailVerified: { type: Boolean, default: false },
   avatar: { type: String, default: '' },
   bio: { type: String, default: '', maxlength: 500 },
+  location: { type: String, default: '', trim: true, maxlength: 100 },
+  website: { type: String, default: '', trim: true, maxlength: 200 },
   reputation: { type: Number, default: 0 },
   role: { type: String, enum: ['user', 'moderator', 'admin'], default: 'user' },
   isFoundingMember: { type: Boolean, default: false },
@@ -340,6 +342,8 @@ function userToResponse(user) {
     email: user.email,
     avatar: user.avatar,
     bio: user.bio,
+    location: user.location || '',
+    website: user.website || '',
     reputation: user.reputation,
     role: user.role,
     isFoundingMember: user.isFoundingMember,
@@ -1529,13 +1533,40 @@ app.get('/api/users/profile', authMiddleware, async (req, res) => {
 app.put('/api/users/profile', authMiddleware, async (req, res) => {
   try {
     const updates = {};
-    if (req.body.name !== undefined) updates.name = sanitizeString(req.body.name, 100);
-    if (req.body.bio !== undefined) updates.bio = sanitizeString(req.body.bio, 500);
-    if (req.body.avatar !== undefined) updates.avatar = sanitizeString(req.body.avatar, 500);
-    const user = await User.findByIdAndUpdate(req.user.userId, updates, { new: true });
+
+    if (req.body.name !== undefined) {
+      const name = sanitizeString(req.body.name, 100);
+      if (!name || name.length < 2) {
+        return res.status(400).json({ success: false, message: 'الاسم يجب أن يكون حرفين على الأقل' });
+      }
+      updates.name = name;
+    }
+
+    if (req.body.bio !== undefined) {
+      updates.bio = sanitizeString(req.body.bio, 500);
+    }
+
+    if (req.body.avatar !== undefined) {
+      updates.avatar = sanitizeString(req.body.avatar, 500);
+    }
+
+    if (req.body.location !== undefined) {
+      updates.location = sanitizeString(req.body.location, 100);
+    }
+
+    if (req.body.website !== undefined) {
+      const website = sanitizeString(req.body.website, 200);
+      if (website && !/^https?:\/\/[^\s]+\.[^\s]+/i.test(website)) {
+        return res.status(400).json({ success: false, message: 'رابط الموقع غير صحيح - يجب أن يبدأ بـ http:// أو https://' });
+      }
+      updates.website = website;
+    }
+
+    const user = await User.findByIdAndUpdate(req.user.userId, updates, { new: true, runValidators: true });
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
     res.json({ success: true, user: userToResponse(user) });
   } catch (error) {
+    console.error('Update profile error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
@@ -1563,6 +1594,8 @@ app.get('/api/users/:id', async (req, res) => {
         name: user.name,
         avatar: user.avatar,
         bio: user.bio,
+        location: user.location || '',
+        website: user.website || '',
         reputation: user.reputation,
         role: user.role,
         isFoundingMember: user.isFoundingMember,
