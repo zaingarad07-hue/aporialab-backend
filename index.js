@@ -132,6 +132,18 @@ async function connectDB() {
   }
 }
 
+const NotificationPreferencesSchema = new mongoose.Schema({
+  comment: { type: Boolean, default: true },
+  reply: { type: Boolean, default: true },
+  discussion_upvote: { type: Boolean, default: true },
+  comment_upvote: { type: Boolean, default: true },
+  reaction_logical: { type: Boolean, default: true },
+  reaction_inspiring: { type: Boolean, default: true },
+  circle_join_request: { type: Boolean, default: true },
+  circle_approved: { type: Boolean, default: true },
+  circle_rejected: { type: Boolean, default: true },
+}, { _id: false });
+
 const UserSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 100 },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true, maxlength: 200 },
@@ -146,6 +158,7 @@ const UserSchema = new mongoose.Schema({
   reputation: { type: Number, default: 0 },
   role: { type: String, enum: ['user', 'moderator', 'admin'], default: 'user' },
   isFoundingMember: { type: Boolean, default: false },
+  notificationPreferences: { type: NotificationPreferencesSchema, default: () => ({}) },
 }, { timestamps: true });
 
 const EditHistoryEntrySchema = new mongoose.Schema({
@@ -285,6 +298,11 @@ async function createNotification({ recipient, sender, type, title, message, lin
   const senderId = sender && sender._id ? sender._id.toString() : null;
   if (senderId && senderId === recipientId) return null;
   try {
+    const recipientDoc = await User.findById(recipientId).select('notificationPreferences').lean();
+    if (!recipientDoc) return null;
+    const prefs = getNotificationPreferences(recipientDoc);
+    if (prefs[type] === false) return null;
+
     const doc = await Notification.create({
       recipient: recipientId,
       sender: sender ? {
@@ -334,6 +352,15 @@ function calculateQualityScore(comment) {
   return Math.round(positive - negative);
 }
 
+function getNotificationPreferences(user) {
+  const stored = (user && user.notificationPreferences) || {};
+  const out = {};
+  for (const type of NOTIFICATION_TYPES) {
+    out[type] = stored[type] === false ? false : true;
+  }
+  return out;
+}
+
 function userToResponse(user) {
   return {
     id: user._id.toString(),
@@ -348,7 +375,8 @@ function userToResponse(user) {
     role: user.role,
     isFoundingMember: user.isFoundingMember,
     authProvider: user.authProvider,
-    emailVerified: user.emailVerified
+    emailVerified: user.emailVerified,
+    notificationPreferences: getNotificationPreferences(user),
   };
 }
 
