@@ -1642,49 +1642,6 @@ app.patch('/api/users/change-password', authMiddleware, authLimiter, async (req,
   }
 });
 
-app.patch('/api/users/change-password', authMiddleware, authLimiter, async (req, res) => {
-  try {
-    const currentPassword = req.body.currentPassword;
-    const newPassword = req.body.newPassword;
-
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({ success: false, message: 'كلمة المرور الحالية والجديدة مطلوبتان' });
-    }
-    if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
-      return res.status(400).json({ success: false, message: 'بيانات غير صحيحة' });
-    }
-    if (newPassword.length < 8) {
-      return res.status(400).json({ success: false, message: 'كلمة المرور الجديدة يجب أن تكون 8 أحرف على الأقل' });
-    }
-    if (newPassword.length > 200) {
-      return res.status(400).json({ success: false, message: 'كلمة المرور الجديدة طويلة جداً' });
-    }
-    if (newPassword === currentPassword) {
-      return res.status(400).json({ success: false, message: 'كلمة المرور الجديدة لا يمكن أن تطابق الحالية' });
-    }
-
-    const user = await User.findById(req.user.userId);
-    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-
-    if (user.authProvider === 'google') {
-      return res.status(403).json({ success: false, message: 'غير متاح للحسابات المُسجَّلة عبر Google' });
-    }
-
-    const isMatch = await bcrypt.compare(currentPassword, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ success: false, message: 'كلمة المرور الحالية غير صحيحة' });
-    }
-
-    user.password = await bcrypt.hash(newPassword, 10);
-    await user.save();
-
-    res.json({ success: true, message: 'تم تغيير كلمة المرور بنجاح' });
-  } catch (error) {
-    console.error('Change password error:', error);
-    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
-  }
-});
-
 app.patch('/api/users/notification-preferences', authMiddleware, async (req, res) => {
   try {
     const body = req.body && typeof req.body === 'object' ? req.body : {};
