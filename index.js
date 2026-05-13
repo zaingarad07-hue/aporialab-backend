@@ -144,8 +144,21 @@ const NotificationPreferencesSchema = new mongoose.Schema({
   circle_rejected: { type: Boolean, default: true },
 }, { _id: false });
 
+const USERNAME_PATTERN = /^[a-z0-9_]{3,30}$/;
+
 const UserSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true, maxlength: 100 },
+  username: {
+    type: String,
+    unique: true,
+    sparse: true,
+    lowercase: true,
+    trim: true,
+    minlength: 3,
+    maxlength: 30,
+    match: USERNAME_PATTERN,
+    default: null,
+  },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true, maxlength: 200 },
   password: { type: String, default: '' },
   googleId: { type: String, default: null, sparse: true, index: true },
@@ -361,10 +374,42 @@ function getNotificationPreferences(user) {
   return out;
 }
 
+function slugifyForUsername(input) {
+  if (typeof input !== 'string') return '';
+  const noCombining = input.normalize('NFKD').replace(/[̀-ͯ]/g, '');
+  return noCombining
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 24);
+}
+
+async function ensureUsernameForUser(user) {
+  if (user.username) return user;
+  const baseRaw = slugifyForUsername(user.name) || slugifyForUsername(user.email.split('@')[0]) || 'user';
+  const base = baseRaw.length < 3 ? (baseRaw + '_user').slice(0, 24) : baseRaw;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const suffix = attempt === 0 ? '' : '_' + Math.random().toString(36).slice(2, 6);
+    const candidate = (base + suffix).slice(0, 30);
+    if (!USERNAME_PATTERN.test(candidate)) continue;
+    const taken = await User.exists({ username: candidate });
+    if (!taken) {
+      user.username = candidate;
+      await user.save();
+      return user;
+    }
+  }
+  const fallback = ('u_' + user._id.toString().slice(-10)).slice(0, 30);
+  user.username = fallback;
+  await user.save();
+  return user;
+}
+
 function userToResponse(user) {
   return {
     id: user._id.toString(),
     _id: user._id.toString(),
+    username: user.username || null,
     name: user.name,
     email: user.email,
     avatar: user.avatar,
@@ -506,7 +551,7 @@ app.post('/api/auth/google', googleAuthLimiter, async (req, res) => {
 
     if (!user) {
       user = await User.findOne({ email });
-      
+
       if (user) {
         user.googleId = googleId;
         user.authProvider = 'google';
@@ -531,6 +576,10 @@ app.post('/api/auth/google', googleAuthLimiter, async (req, res) => {
       }
     }
 
+    if (!user.username) {
+      user = await ensureUsernameForUser(user);
+    }
+
     const token = jwt.sign(
       { userId: user._id.toString(), email: user.email },
       JWT_SECRET,
@@ -549,13 +598,14 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const email = sanitizeString(req.body.email, 200).toLowerCase();
     const password = req.body.password;
     if (!isValidEmail(email) || !password) return res.status(400).json({ success: false, message: 'بيانات غير صحيحة' });
-    const user = await User.findOne({ email });
+    let user = await User.findOne({ email });
     if (!user) return res.status(401).json({ success: false, message: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
     if (user.authProvider === 'google' && !user.password) {
       return res.status(401).json({ success: false, message: 'هذا الحساب يُسجّل الدخول بـ Google' });
     }
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).json({ success: false, message: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
+    if (!user.username) user = await ensureUsernameForUser(user);
     const token = jwt.sign({ userId: user._id.toString(), email: user.email }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ success: true, token, user: userToResponse(user) });
   } catch (error) {
@@ -576,13 +626,14 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const existing = await User.findOne({ email });
     if (existing) return res.status(400).json({ success: false, message: 'هذا البريد الإلكتروني مسجل مسبقاً' });
     const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = await User.create({
+    let newUser = await User.create({
       name, email, password: hashedPassword,
       authProvider: 'local',
       emailVerified: false,
       avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + encodeURIComponent(email),
       bio: '', reputation: 0, role: 'user', isFoundingMember: false
     });
+    newUser = await ensureUsernameForUser(newUser);
     const token = jwt.sign({ userId: newUser._id.toString(), email: newUser.email }, JWT_SECRET, { expiresIn: '30d' });
     res.status(201).json({ success: true, token, user: userToResponse(newUser) });
   } catch (error) {
@@ -593,8 +644,11 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
-    const user = await User.findById(req.user.userId);
+    let user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (!user.username) {
+      user = await ensureUsernameForUser(user);
+    }
     res.json({ success: true, user: userToResponse(user) });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
@@ -1674,26 +1728,97 @@ app.patch('/api/users/notification-preferences', authMiddleware, async (req, res
   }
 });
 
+const RESERVED_USERNAMES = new Set([
+  'admin', 'administrator', 'root', 'api', 'auth', 'me', 'login', 'register',
+  'logout', 'signin', 'signup', 'settings', 'profile', 'profiles', 'user',
+  'users', 'discussion', 'discussions', 'circle', 'circles', 'notification',
+  'notifications', 'search', 'home', 'feed', 'about', 'help', 'support',
+  'terms', 'privacy', 'contact', 'aporialab', 'aporia',
+]);
+
+function validateUsernameShape(raw) {
+  if (typeof raw !== 'string') return { ok: false, message: 'اسم المستخدم غير صحيح' };
+  const value = raw.trim().toLowerCase();
+  if (!USERNAME_PATTERN.test(value)) {
+    return { ok: false, message: 'اسم المستخدم يجب أن يكون 3-30 حرفاً ويحتوي فقط على حروف إنجليزية صغيرة وأرقام وشرطة سفلية' };
+  }
+  if (RESERVED_USERNAMES.has(value)) {
+    return { ok: false, message: 'اسم المستخدم محجوز' };
+  }
+  return { ok: true, value };
+}
+
+app.get('/api/users/check-username', async (req, res) => {
+  try {
+    const raw = (req.query.username || '').toString();
+    const check = validateUsernameShape(raw);
+    if (!check.ok) {
+      return res.json({ success: true, available: false, reason: check.message });
+    }
+    const taken = await User.exists({ username: check.value });
+    res.json({ success: true, available: !taken, username: check.value });
+  } catch (error) {
+    console.error('check-username error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.patch('/api/users/username', authMiddleware, async (req, res) => {
+  try {
+    const check = validateUsernameShape(req.body && req.body.username);
+    if (!check.ok) {
+      return res.status(400).json({ success: false, message: check.message });
+    }
+    const me = await User.findById(req.user.userId);
+    if (!me) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (me.username === check.value) {
+      return res.json({ success: true, user: userToResponse(me) });
+    }
+    const taken = await User.exists({ username: check.value, _id: { $ne: me._id } });
+    if (taken) {
+      return res.status(409).json({ success: false, message: 'اسم المستخدم مستخدم بالفعل' });
+    }
+    me.username = check.value;
+    try {
+      await me.save();
+    } catch (err) {
+      if (err && err.code === 11000) {
+        return res.status(409).json({ success: false, message: 'اسم المستخدم مستخدم بالفعل' });
+      }
+      throw err;
+    }
+    res.json({ success: true, user: userToResponse(me) });
+  } catch (error) {
+    console.error('Update username error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
 app.get('/api/users/:id', async (req, res) => {
   try {
-    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    const param = req.params.id;
+    let user;
+    if (mongoose.Types.ObjectId.isValid(param) && param.length === 24) {
+      user = await User.findById(param).select('-password').lean();
     }
-    const user = await User.findById(req.params.id).select('-password').lean();
+    if (!user && USERNAME_PATTERN.test(param.toLowerCase())) {
+      user = await User.findOne({ username: param.toLowerCase() }).select('-password').lean();
+    }
     if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
-    
+
     const discussions = await Discussion.find({ 'author._id': user._id })
       .sort({ createdAt: -1 })
       .limit(20)
       .lean();
-    
+
     const discussionCount = await Discussion.countDocuments({ 'author._id': user._id });
-    
+
     res.json({
       success: true,
       user: {
         id: user._id.toString(),
         _id: user._id.toString(),
+        username: user.username || null,
         name: user.name,
         avatar: user.avatar,
         bio: user.bio,
@@ -1705,7 +1830,7 @@ app.get('/api/users/:id', async (req, res) => {
         discussionCount,
         createdAt: user.createdAt
       },
-      discussions: discussions.map(d => Object.assign({}, d, { 
+      discussions: discussions.map(d => Object.assign({}, d, {
         _id: d._id.toString(),
         isExpired: isDiscussionExpired(d)
       }))
