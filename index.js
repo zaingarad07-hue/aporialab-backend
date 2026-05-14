@@ -1320,6 +1320,69 @@ app.get('/api/circles', async (req, res) => {
   }
 });
 
+app.post('/api/circles', authMiddleware, async (req, res) => {
+  try {
+    const name = sanitizeString(req.body.name, 100);
+    if (!name || name.length < 3) {
+      return res.status(400).json({ success: false, message: 'اسم الدائرة يجب أن يكون 3 أحرف على الأقل' });
+    }
+
+    const description = sanitizeString(req.body.description || '', 500);
+    const category = sanitizeString(req.body.category || '', 50);
+    const isPrivate = req.body.isPrivate === true;
+
+    let icon = typeof req.body.icon === 'string' ? req.body.icon.trim().slice(0, 4) : '';
+    if (!icon) icon = '🌐';
+
+    let color = typeof req.body.color === 'string' ? req.body.color.trim() : '';
+    if (!/^#[0-9a-fA-F]{6}$/.test(color)) color = '#daa520';
+
+    let tags = [];
+    if (Array.isArray(req.body.tags)) {
+      tags = req.body.tags
+        .filter(t => typeof t === 'string')
+        .map(t => sanitizeString(t, 30))
+        .filter(t => t.length > 0)
+        .slice(0, 10);
+    }
+
+    const nameTaken = await Circle.exists({ name });
+    if (nameTaken) {
+      return res.status(409).json({ success: false, message: 'اسم الدائرة مستخدم بالفعل' });
+    }
+
+    const user = await User.findById(req.user.userId).select('name').lean();
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+
+    const userId = req.user.userId;
+    const circle = await Circle.create({
+      name,
+      description,
+      category: category || undefined,
+      isPrivate,
+      icon,
+      color,
+      tags,
+      memberIds: [userId],
+      members: 1,
+      pendingRequests: [],
+      discussionCount: 0,
+      createdBy: { _id: userId, name: user.name },
+    });
+
+    res.status(201).json({
+      success: true,
+      circle: Object.assign({}, circle.toObject(), { _id: circle._id.toString() }),
+    });
+  } catch (error) {
+    console.error('Create circle error:', error);
+    if (error && error.code === 11000) {
+      return res.status(409).json({ success: false, message: 'اسم الدائرة مستخدم بالفعل' });
+    }
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
 app.get('/api/circles/:id', async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
