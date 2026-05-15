@@ -5,6 +5,7 @@ const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
@@ -93,6 +94,11 @@ if (!JWT_SECRET) {
 const MONGODB_URI = process.env.MONGODB_URI;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
+const CLOUDINARY_AVATAR_FOLDER = 'aporialab/avatars';
+const cloudinaryConfigured = () => Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET);
 
 const googleClient = new OAuth2Client(GOOGLE_CLIENT_ID);
 
@@ -1712,6 +1718,59 @@ app.put('/api/users/profile', authMiddleware, async (req, res) => {
     res.json({ success: true, user: userToResponse(user) });
   } catch (error) {
     console.error('Update profile error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.post('/api/users/avatar/signature', authMiddleware, async (req, res) => {
+  try {
+    if (!cloudinaryConfigured()) {
+      return res.status(503).json({ success: false, message: 'خدمة رفع الصور غير مفعّلة على الخادم' });
+    }
+    const timestamp = Math.floor(Date.now() / 1000);
+    const publicId = 'user_' + req.user.userId + '_' + timestamp;
+    const paramsToSign = 'folder=' + CLOUDINARY_AVATAR_FOLDER + '&public_id=' + publicId + '&timestamp=' + timestamp;
+    const signature = crypto.createHash('sha1').update(paramsToSign + CLOUDINARY_API_SECRET).digest('hex');
+    res.json({
+      success: true,
+      signature,
+      timestamp,
+      apiKey: CLOUDINARY_API_KEY,
+      cloudName: CLOUDINARY_CLOUD_NAME,
+      folder: CLOUDINARY_AVATAR_FOLDER,
+      publicId
+    });
+  } catch (error) {
+    console.error('Avatar signature error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.patch('/api/users/avatar', authMiddleware, async (req, res) => {
+  try {
+    const raw = (req.body && req.body.avatarUrl !== undefined) ? req.body.avatarUrl : null;
+    if (raw === null || raw === '') {
+      const user = await User.findByIdAndUpdate(req.user.userId, { avatar: '' }, { new: true });
+      if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+      return res.json({ success: true, user: userToResponse(user) });
+    }
+    const avatarUrl = sanitizeString(raw, 500);
+    if (!avatarUrl) {
+      return res.status(400).json({ success: false, message: 'رابط الصورة غير صحيح' });
+    }
+    if (!cloudinaryConfigured()) {
+      return res.status(503).json({ success: false, message: 'خدمة رفع الصور غير مفعّلة على الخادم' });
+    }
+    const expectedHost = 'res.cloudinary.com/' + CLOUDINARY_CLOUD_NAME + '/';
+    const isCloudinary = avatarUrl.startsWith('https://' + expectedHost) && avatarUrl.includes('/' + CLOUDINARY_AVATAR_FOLDER + '/');
+    if (!isCloudinary) {
+      return res.status(400).json({ success: false, message: 'رابط الصورة يجب أن يكون من خدمة الرفع المعتمدة' });
+    }
+    const user = await User.findByIdAndUpdate(req.user.userId, { avatar: avatarUrl }, { new: true, runValidators: true });
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    res.json({ success: true, user: userToResponse(user) });
+  } catch (error) {
+    console.error('Update avatar error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });

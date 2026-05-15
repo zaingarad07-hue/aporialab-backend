@@ -15,6 +15,7 @@ Arabic philosophy discussion platform. Single-file Express 4 API on Vercel + Mon
 | `GOOGLE_CLIENT_ID` | optional | Google OAuth (returns 503 if empty) |
 | `ADMIN_KEY` | optional | required for `/api/admin/*` (sent as `x-admin-key` header) |
 | `ALLOWED_ORIGINS` | optional | extra CORS origins, CSV |
+| `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` | optional | enables avatar upload. All three must be set; otherwise `/api/users/avatar/signature` and `/api/users/avatar` return 503. Avatars are stored under the `aporialab/avatars` folder. |
 
 ## Core models
 - `User` — name, email (unique), password (bcrypt), googleId, authProvider, avatar, bio, reputation, role, isFoundingMember.
@@ -62,9 +63,16 @@ Arabic philosophy discussion platform. Single-file Express 4 API on Vercel + Mon
 - Working branch convention used so far: `claude/<topic>`.
 - PRs gated by Vercel preview deployments. Merge after preview is verified.
 
+## Avatar upload (Cloudinary, signed flow)
+**Endpoints (both `authMiddleware`):**
+- `POST /api/users/avatar/signature` → returns `{ signature, timestamp, apiKey, cloudName, folder, publicId }`. Folder is fixed at `aporialab/avatars`. `publicId` is `user_<userId>_<timestamp>` so re-uploads don't overwrite.
+- `PATCH /api/users/avatar` with `{ avatarUrl }` → validates that the URL is `https://res.cloudinary.com/<cloudName>/...` and contains the `/aporialab/avatars/` segment, sanitizes via `sanitizeString(url, 500)`, updates `user.avatar`, returns updated user. Passing empty string clears the avatar.
+
+**Frontend flow:**
+1. Fetch signature from backend.
+2. `POST` the file to `https://api.cloudinary.com/v1_1/<cloudName>/image/upload` as multipart/form-data with `file`, `api_key`, `timestamp`, `folder`, `public_id`, `signature`.
+3. Send the returned `secure_url` to `PATCH /api/users/avatar`.
+
 ## Backlog for next sessions
-- **User Profile features** — edit profile, change password, avatar URL update.
 - **Better authentication flow** — password reset (uses `emailVerified` field already on User), email verification.
-- **Profile image upload via Cloudinary** — requires new endpoint `POST /api/users/avatar` that accepts a Cloudinary signed URL or accepts the upload result from frontend; currently `avatar` is a free-text URL.
-- **User settings page** — bundles profile/password/avatar.
 - Long-term: split `index.js`, add tests + CI, JWT in httpOnly cookies, password reset emails (needs SMTP/SendGrid or similar).
