@@ -97,6 +97,9 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY || '';
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET || '';
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const EMAIL_FROM = process.env.EMAIL_FROM || 'AporiaLab <onboarding@resend.dev>';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://aporialab.space';
 const CLOUDINARY_AVATAR_FOLDER = 'aporialab/avatars';
 const cloudinaryConfigured = () => Boolean(CLOUDINARY_CLOUD_NAME && CLOUDINARY_API_KEY && CLOUDINARY_API_SECRET);
 
@@ -170,6 +173,11 @@ const UserSchema = new mongoose.Schema({
   googleId: { type: String, default: null, sparse: true, index: true },
   authProvider: { type: String, enum: ['local', 'google'], default: 'local' },
   emailVerified: { type: Boolean, default: false },
+  emailVerificationTokenHash: { type: String, default: null },
+  emailVerificationTokenExpiry: { type: Date, default: null },
+  passwordResetTokenHash: { type: String, default: null },
+  passwordResetTokenExpiry: { type: Date, default: null },
+  lastVerificationEmailSentAt: { type: Date, default: null },
   avatar: { type: String, default: '' },
   bio: { type: String, default: '', maxlength: 500 },
   location: { type: String, default: '', trim: true, maxlength: 100 },
@@ -300,6 +308,8 @@ CommentSchema.index({ parentCommentId: 1 });
 CommentSchema.index({ 'author._id': 1, createdAt: -1 });
 
 UserSchema.index({ reputation: -1 });
+UserSchema.index({ emailVerificationTokenHash: 1 }, { sparse: true });
+UserSchema.index({ passwordResetTokenHash: 1 }, { sparse: true });
 
 NotificationSchema.index({ recipient: 1, isRead: 1, createdAt: -1 });
 NotificationSchema.index({ recipient: 1, type: 1, createdAt: -1 });
@@ -431,6 +441,100 @@ function userToResponse(user) {
   };
 }
 
+function generateAuthToken(ttlMs) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const expiry = new Date(Date.now() + ttlMs);
+  return { token, tokenHash, expiry };
+}
+
+function hashAuthToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+async function sendEmail({ to, subject, html, text }) {
+  if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY is not configured');
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + RESEND_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ from: EMAIL_FROM, to, subject, html, text }),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error('Resend API ' + response.status + ': ' + body);
+  }
+  return await response.json();
+}
+
+async function sendVerificationEmail(user, plainToken) {
+  const link = FRONTEND_URL + '/verify-email/' + plainToken;
+  const safeName = escapeHtml(user.name || '');
+  const safeLink = escapeHtml(link);
+  const subject = 'وثق بريدك الالكتروني - Verify your AporiaLab email';
+  const text = 'مرحباً ' + (user.name || '') + '،\n\n'
+    + 'لتفعيل حسابك في AporiaLab والمشاركة في النقاشات، يرجى تأكيد بريدك الالكتروني عبر الرابط التالي:\n'
+    + link + '\n\n'
+    + 'هذا الرابط صالح لمدة 24 ساعة.\n\n'
+    + 'إذا لم تنشئ هذا الحساب يمكنك تجاهل هذه الرسالة.\n\n'
+    + 'AporiaLab';
+  const html = '<div dir="rtl" style="font-family: system-ui, sans-serif; max-width: 560px; margin: 0 auto; padding: 24px; color: #111;">'
+    + '<h2 style="color: #111;">وثق بريدك الالكتروني</h2>'
+    + '<p>مرحباً ' + safeName + '،</p>'
+    + '<p>لتفعيل حسابك في AporiaLab والمشاركة في النقاشات، اضغط على الزر التالي:</p>'
+    + '<p style="margin: 24px 0;"><a href="' + safeLink + '" style="background: #0f172a; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">توثيق البريد الالكتروني</a></p>'
+    + '<p style="color: #555; font-size: 14px;">أو انسخ الرابط التالي إلى متصفحك:</p>'
+    + '<p style="word-break: break-all; color: #555; font-size: 13px;">' + safeLink + '</p>'
+    + '<p style="color: #888; font-size: 13px; margin-top: 24px;">هذا الرابط صالح لمدة 24 ساعة. إذا لم تنشئ هذا الحساب يمكنك تجاهل هذه الرسالة.</p>'
+    + '<hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;" />'
+    + '<p style="color: #888; font-size: 12px;">AporiaLab - منصة النقاش الفلسفي</p>'
+    + '</div>';
+  try {
+    await sendEmail({ to: user.email, subject, html, text });
+    return true;
+  } catch (e) {
+    console.error('sendVerificationEmail failed:', e.message);
+    return false;
+  }
+}
+
+async function sendPasswordResetEmail(user, plainToken) {
+  const link = FRONTEND_URL + '/reset-password/' + plainToken;
+  const safeName = escapeHtml(user.name || '');
+  const safeLink = escapeHtml(link);
+  const subject = 'إعادة تعيين كلمة المرور - Reset your AporiaLab password';
+  const text = 'مرحباً ' + (user.name || '') + '،\n\n'
+    + 'تلقينا طلباً لإعادة تعيين كلمة مرور حسابك في AporiaLab. لإعادة التعيين اضغط على الرابط التالي:\n'
+    + link + '\n\n'
+    + 'هذا الرابط صالح لمدة ساعة واحدة فقط.\n\n'
+    + 'إذا لم تطلب إعادة التعيين يمكنك تجاهل هذه الرسالة، وستظل كلمة مرورك الحالية كما هي.\n\n'
+    + 'AporiaLab';
+  const html = '<div dir="rtl" style="font-family: system-ui, sans-serif; max-width: 560px; margin: 0 auto; padding: 24px; color: #111;">'
+    + '<h2 style="color: #111;">إعادة تعيين كلمة المرور</h2>'
+    + '<p>مرحباً ' + safeName + '،</p>'
+    + '<p>تلقينا طلباً لإعادة تعيين كلمة مرور حسابك. اضغط على الزر التالي لاختيار كلمة مرور جديدة:</p>'
+    + '<p style="margin: 24px 0;"><a href="' + safeLink + '" style="background: #0f172a; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">إعادة تعيين كلمة المرور</a></p>'
+    + '<p style="color: #555; font-size: 14px;">أو انسخ الرابط التالي إلى متصفحك:</p>'
+    + '<p style="word-break: break-all; color: #555; font-size: 13px;">' + safeLink + '</p>'
+    + '<p style="color: #888; font-size: 13px; margin-top: 24px;">هذا الرابط صالح لمدة ساعة واحدة فقط. إذا لم تطلب إعادة التعيين يمكنك تجاهل هذه الرسالة.</p>'
+    + '<hr style="border: none; border-top: 1px solid #eee; margin: 24px 0;" />'
+    + '<p style="color: #888; font-size: 12px;">AporiaLab - منصة النقاش الفلسفي</p>'
+    + '</div>';
+  try {
+    await sendEmail({ to: user.email, subject, html, text });
+    return true;
+  } catch (e) {
+    console.error('sendPasswordResetEmail failed:', e.message);
+    return false;
+  }
+}
+
 async function updateAuthorReputation(authorId, points) {
   if (!authorId || !points) return;
   try {
@@ -452,6 +556,22 @@ function authMiddleware(req, res, next) {
     next();
   } catch (e) {
     return res.status(401).json({ success: false, message: 'جلسة منتهية - يرجى تسجيل الدخول مجدداً' });
+  }
+}
+
+async function requireVerifiedEmail(req, res, next) {
+  try {
+    const u = await User.findById(req.user.userId).select('emailVerified authProvider').lean();
+    if (!u) return res.status(401).json({ success: false, message: 'المستخدم غير موجود' });
+    if (u.authProvider === 'google' || u.emailVerified === true) return next();
+    return res.status(403).json({
+      success: false,
+      message: 'يجب توثيق بريدك الالكتروني قبل المشاركة',
+      code: 'EMAIL_NOT_VERIFIED',
+    });
+  } catch (e) {
+    console.error('requireVerifiedEmail error:', e.message);
+    return res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 }
 
@@ -640,10 +760,122 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       bio: '', reputation: 0, role: 'user', isFoundingMember: false
     });
     newUser = await ensureUsernameForUser(newUser);
+
+    const { token: verifyToken, tokenHash: verifyHash, expiry: verifyExpiry } = generateAuthToken(24 * 60 * 60 * 1000);
+    newUser.emailVerificationTokenHash = verifyHash;
+    newUser.emailVerificationTokenExpiry = verifyExpiry;
+    newUser.lastVerificationEmailSentAt = new Date();
+    await newUser.save();
+    sendVerificationEmail(newUser, verifyToken).catch((e) => console.error('Verification email failed on register:', e.message));
+
     const token = jwt.sign({ userId: newUser._id.toString(), email: newUser.email }, JWT_SECRET, { expiresIn: '30d' });
     res.status(201).json({ success: true, token, user: userToResponse(newUser) });
   } catch (error) {
     console.error('Register error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.post('/api/auth/verify-email', async (req, res) => {
+  try {
+    const token = typeof req.body.token === 'string' ? req.body.token.trim() : '';
+    if (!/^[a-f0-9]{64}$/.test(token)) {
+      return res.status(400).json({ success: false, message: 'رابط التوثيق غير صالح' });
+    }
+    const tokenHash = hashAuthToken(token);
+    const user = await User.findOne({ emailVerificationTokenHash: tokenHash });
+    if (!user) return res.status(400).json({ success: false, message: 'رابط التوثيق غير صالح أو سبق استخدامه' });
+    if (!user.emailVerificationTokenExpiry || user.emailVerificationTokenExpiry.getTime() < Date.now()) {
+      user.emailVerificationTokenHash = null;
+      user.emailVerificationTokenExpiry = null;
+      await user.save();
+      return res.status(400).json({ success: false, message: 'انتهت صلاحية رابط التوثيق، أعد طلب التوثيق' });
+    }
+    user.emailVerified = true;
+    user.emailVerificationTokenHash = null;
+    user.emailVerificationTokenExpiry = null;
+    await user.save();
+    const authToken = jwt.sign({ userId: user._id.toString(), email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ success: true, token: authToken, user: userToResponse(user), message: 'تم توثيق البريد الإلكتروني' });
+  } catch (error) {
+    console.error('Verify email error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.post('/api/auth/resend-verification', authMiddleware, async (req, res) => {
+  try {
+    if (!RESEND_API_KEY) return res.status(503).json({ success: false, message: 'إرسال البريد غير مفعّل' });
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+    if (user.emailVerified) return res.json({ success: true, message: 'بريدك موثّق مسبقاً' });
+    if (user.lastVerificationEmailSentAt && Date.now() - user.lastVerificationEmailSentAt.getTime() < 60_000) {
+      return res.status(429).json({ success: false, message: 'انتظر دقيقة قبل إعادة الإرسال' });
+    }
+    const { token, tokenHash, expiry } = generateAuthToken(24 * 60 * 60 * 1000);
+    user.emailVerificationTokenHash = tokenHash;
+    user.emailVerificationTokenExpiry = expiry;
+    user.lastVerificationEmailSentAt = new Date();
+    await user.save();
+    sendVerificationEmail(user, token).catch((e) => console.error('Resend verification email failed:', e.message));
+    res.json({ success: true, message: 'أرسلنا رسالة جديدة إلى بريدك' });
+  } catch (error) {
+    console.error('Resend verification error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
+  const genericMessage = 'إذا كان البريد مسجّلاً ستصلك رسالة لإعادة تعيين كلمة المرور';
+  try {
+    const email = sanitizeString(req.body.email || '', 200).toLowerCase();
+    if (!isValidEmail(email)) {
+      return res.json({ success: true, message: genericMessage });
+    }
+    const user = await User.findOne({ email });
+    if (user && user.authProvider !== 'google') {
+      const { token, tokenHash, expiry } = generateAuthToken(60 * 60 * 1000);
+      user.passwordResetTokenHash = tokenHash;
+      user.passwordResetTokenExpiry = expiry;
+      await user.save();
+      sendPasswordResetEmail(user, token).catch((e) => console.error('Password reset email failed:', e.message));
+    }
+    res.json({ success: true, message: genericMessage });
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.json({ success: true, message: genericMessage });
+  }
+});
+
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
+  try {
+    const token = typeof req.body.token === 'string' ? req.body.token.trim() : '';
+    const newPassword = req.body.newPassword;
+    if (!/^[a-f0-9]{64}$/.test(token)) {
+      return res.status(400).json({ success: false, message: 'رابط إعادة التعيين غير صالح' });
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
+      return res.status(400).json({ success: false, message: 'كلمة المرور يجب أن تكون 6 أحرف على الأقل' });
+    }
+    if (newPassword.length > 200) {
+      return res.status(400).json({ success: false, message: 'كلمة المرور طويلة جداً' });
+    }
+    const tokenHash = hashAuthToken(token);
+    const user = await User.findOne({ passwordResetTokenHash: tokenHash });
+    if (!user) return res.status(400).json({ success: false, message: 'رابط إعادة التعيين غير صالح أو سبق استخدامه' });
+    if (!user.passwordResetTokenExpiry || user.passwordResetTokenExpiry.getTime() < Date.now()) {
+      user.passwordResetTokenHash = null;
+      user.passwordResetTokenExpiry = null;
+      await user.save();
+      return res.status(400).json({ success: false, message: 'انتهت صلاحية الرابط، اطلب إعادة تعيين جديدة' });
+    }
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.passwordResetTokenHash = null;
+    user.passwordResetTokenExpiry = null;
+    await user.save();
+    res.json({ success: true, message: 'تم تحديث كلمة المرور، يمكنك الآن تسجيل الدخول' });
+  } catch (error) {
+    console.error('Reset password error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
@@ -762,7 +994,7 @@ app.get('/api/discussions/:id/history', async (req, res) => {
   }
 });
 
-app.post('/api/discussions', authMiddleware, async (req, res) => {
+app.post('/api/discussions', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     const title = sanitizeString(req.body.title, 200);
     const content = sanitizeString(req.body.content || req.body.description, 10000);
@@ -807,7 +1039,7 @@ app.post('/api/discussions', authMiddleware, async (req, res) => {
   }
 });
 
-app.patch('/api/discussions/:id', authMiddleware, async (req, res) => {
+app.patch('/api/discussions/:id', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
@@ -870,7 +1102,7 @@ app.patch('/api/discussions/:id', authMiddleware, async (req, res) => {
   }
 });
 
-app.delete('/api/discussions/:id', authMiddleware, async (req, res) => {
+app.delete('/api/discussions/:id', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
@@ -896,7 +1128,7 @@ app.delete('/api/discussions/:id', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/discussions/:id/like', authMiddleware, async (req, res) => {
+app.post('/api/discussions/:id/like', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const discussion = await Discussion.findById(req.params.id);
@@ -928,7 +1160,7 @@ app.post('/api/discussions/:id/like', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
+app.post('/api/discussions/:id/comments', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const discussion = await Discussion.findById(req.params.id);
@@ -1049,7 +1281,7 @@ app.post('/api/discussions/:id/comments', authMiddleware, async (req, res) => {
   }
 });
 
-app.patch('/api/comments/:id', authMiddleware, async (req, res) => {
+app.patch('/api/comments/:id', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
@@ -1096,7 +1328,7 @@ app.patch('/api/comments/:id', authMiddleware, async (req, res) => {
   }
 });
 
-app.post('/api/comments/:id/upvote', authMiddleware, async (req, res) => {
+app.post('/api/comments/:id/upvote', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
@@ -1162,7 +1394,7 @@ const REACTION_REPUTATION_MAP = {
   unclear: 'RECEIVE_UNCLEAR',
 };
 
-app.post('/api/comments/:id/react', authMiddleware, async (req, res) => {
+app.post('/api/comments/:id/react', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
@@ -1273,7 +1505,7 @@ app.post('/api/comments/:id/react', authMiddleware, async (req, res) => {
   }
 });
 
-app.delete('/api/comments/:id', authMiddleware, async (req, res) => {
+app.delete('/api/comments/:id', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
@@ -1326,7 +1558,7 @@ app.get('/api/circles', async (req, res) => {
   }
 });
 
-app.post('/api/circles', authMiddleware, async (req, res) => {
+app.post('/api/circles', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     const name = sanitizeString(req.body.name, 100);
     if (!name || name.length < 3) {
@@ -1400,7 +1632,7 @@ app.get('/api/circles/:id', async (req, res) => {
   }
 });
 
-app.post('/api/circles/:id/join', authMiddleware, async (req, res) => {
+app.post('/api/circles/:id/join', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const circle = await Circle.findById(req.params.id);
@@ -1461,7 +1693,7 @@ app.post('/api/circles/:id/join', authMiddleware, async (req, res) => {
 });
 
 // Approve a pending request (admin/owner only)
-app.post('/api/circles/:id/approve/:userId', authMiddleware, async (req, res) => {
+app.post('/api/circles/:id/approve/:userId', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const circle = await Circle.findById(req.params.id);
@@ -1507,7 +1739,7 @@ app.post('/api/circles/:id/approve/:userId', authMiddleware, async (req, res) =>
 });
 
 // Reject a pending request
-app.post('/api/circles/:id/reject/:userId', authMiddleware, async (req, res) => {
+app.post('/api/circles/:id/reject/:userId', authMiddleware, requireVerifiedEmail, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
     const circle = await Circle.findById(req.params.id);
@@ -1809,6 +2041,8 @@ app.patch('/api/users/change-password', authMiddleware, authLimiter, async (req,
     }
 
     user.password = await bcrypt.hash(newPassword, 10);
+    user.passwordResetTokenHash = null;
+    user.passwordResetTokenExpiry = null;
     await user.save();
 
     res.json({ success: true, message: 'تم تغيير كلمة المرور بنجاح' });
