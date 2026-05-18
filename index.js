@@ -666,24 +666,48 @@ app.get('/api/discussions', async (req, res) => {
     const sort = req.query.sort || 'trending';
     const level = req.query.level;
     const filter = req.query.filter;
+    const q = (req.query.q || '').toString().trim().slice(0, 100);
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 10));
+
+    if (q && q.length < 2) {
+      return res.json({
+        success: true,
+        discussions: [],
+        pagination: { page: 1, pages: 0, total: 0 },
+        message: 'اكتب حرفين على الأقل للبحث'
+      });
+    }
+
     const query = {};
     if (level && level !== 'all') query.category = level;
     if (filter && filter !== 'all') query.category = filter;
+
+    if (q && q.length >= 2) {
+      const searchRegex = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      query.$or = [
+        { title: searchRegex },
+        { content: searchRegex },
+        { tags: searchRegex }
+      ];
+    }
+
     let sortObj = { createdAt: -1 };
-    if (sort === 'trending') sortObj = { views: -1, createdAt: -1 };
-    else if (sort === 'featured') sortObj = { upvotes: -1 };
+    if (sort === 'trending' || sort === 'mostViewed') sortObj = { views: -1, createdAt: -1 };
+    else if (sort === 'featured' || sort === 'popular') sortObj = { upvotes: -1 };
     else if (sort === 'live') sortObj = { commentCount: -1 };
+    else if (sort === 'oldest') sortObj = { createdAt: 1 };
+    // 'newest' falls through to default { createdAt: -1 }
+
     const total = await Discussion.countDocuments(query);
     const discussions = await Discussion.find(query).sort(sortObj).skip((page - 1) * limit).limit(limit).lean();
-    res.json({ 
-      success: true, 
-      discussions: discussions.map(d => Object.assign({}, d, { 
+    res.json({
+      success: true,
+      discussions: discussions.map(d => Object.assign({}, d, {
         _id: d._id.toString(),
         isExpired: isDiscussionExpired(d)
-      })), 
-      pagination: { page, pages: Math.ceil(total / limit), total } 
+      })),
+      pagination: { page, pages: Math.ceil(total / limit), total }
     });
   } catch (error) {
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
