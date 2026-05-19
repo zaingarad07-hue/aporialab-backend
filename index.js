@@ -213,6 +213,8 @@ const DiscussionSchema = new mongoose.Schema({
   editHistory: [EditHistoryEntrySchema],
   editedAt: { type: Date, default: null },
   editsCount: { type: Number, default: 0 },
+  isFeatured: { type: Boolean, default: false, index: true },
+  featuredAt: { type: Date, default: null },
 }, { timestamps: true });
 
 const CommentSchema = new mongoose.Schema({
@@ -288,6 +290,12 @@ const NotificationSchema = new mongoose.Schema({
   isRead: { type: Boolean, default: false, index: true },
 }, { timestamps: true });
 
+const PresenceSchema = new mongoose.Schema({
+  discussionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Discussion', required: true, index: true },
+  visitorKey: { type: String, required: true, maxlength: 80 },
+  lastSeenAt: { type: Date, default: Date.now },
+});
+
 DiscussionSchema.index({ createdAt: -1 });
 DiscussionSchema.index({ views: -1, createdAt: -1 });
 DiscussionSchema.index({ category: 1, createdAt: -1 });
@@ -305,11 +313,15 @@ NotificationSchema.index({ recipient: 1, isRead: 1, createdAt: -1 });
 NotificationSchema.index({ recipient: 1, type: 1, createdAt: -1 });
 NotificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 60 });
 
+PresenceSchema.index({ discussionId: 1, visitorKey: 1 }, { unique: true });
+PresenceSchema.index({ lastSeenAt: 1 }, { expireAfterSeconds: 90 });
+
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 const Discussion = mongoose.models.Discussion || mongoose.model('Discussion', DiscussionSchema);
 const Comment = mongoose.models.Comment || mongoose.model('Comment', CommentSchema);
 const Circle = mongoose.models.Circle || mongoose.model('Circle', CircleSchema);
 const Notification = mongoose.models.Notification || mongoose.model('Notification', NotificationSchema);
+const Presence = mongoose.models.Presence || mongoose.model('Presence', PresenceSchema);
 
 async function createNotification({ recipient, sender, type, title, message, link, metadata }) {
   if (!recipient) return null;
@@ -347,6 +359,26 @@ function sanitizeString(str, maxLen) {
   if (typeof str !== 'string') return '';
   maxLen = maxLen || 1000;
   return str.trim().slice(0, maxLen).replace(/[\x00-\x1F\x7F]/g, '');
+}
+
+function visitorKeyFromReq(req) {
+  if (req.user && req.user.userId) return 'u:' + req.user.userId;
+  const fwd = (req.headers['x-forwarded-for'] || '').toString();
+  const ip = fwd ? fwd.split(',')[0].trim() : (req.ip || '0.0.0.0');
+  const ua = (req.headers['user-agent'] || '').toString().slice(0, 64);
+  return 'a:' + crypto.createHash('sha256').update(ip + '|' + ua).digest('hex').slice(0, 32);
+}
+
+function optionalAuthFromHeader(req) {
+  try {
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Bearer ')) return null;
+    const token = auth.slice(7);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    return decoded && decoded.userId ? { userId: decoded.userId, email: decoded.email } : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 function isValidEmail(email) {
@@ -661,6 +693,49 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   }
 });
 
+app.get('/api/discussions/featured', async (req, res) => {
+  try {
+    const limit = Math.min(10, Math.max(1, parseInt(req.query.limit) || 3));
+    const discussions = await Discussion.find({ isFeatured: true })
+      .sort({ featuredAt: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+    res.json({
+      success: true,
+      discussions: discussions.map(d => Object.assign({}, d, {
+        _id: d._id.toString(),
+        isExpired: isDiscussionExpired(d)
+      }))
+    });
+  } catch (error) {
+    console.error('Featured discussions error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/discussions/presence-batch', async (req, res) => {
+  try {
+    const raw = (req.query.ids || '').toString();
+    if (!raw) return res.json({ success: true, counts: {} });
+    const ids = raw.split(',').map(s => s.trim()).filter(Boolean).slice(0, 30);
+    const validIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+    if (validIds.length === 0) return res.json({ success: true, counts: {} });
+    const objectIds = validIds.map(id => new mongoose.Types.ObjectId(id));
+    const cutoff = new Date(Date.now() - 90 * 1000);
+    const results = await Presence.aggregate([
+      { $match: { discussionId: { $in: objectIds }, lastSeenAt: { $gte: cutoff } } },
+      { $group: { _id: '$discussionId', count: { $sum: 1 } } }
+    ]);
+    const counts = {};
+    validIds.forEach(id => { counts[id] = 0; });
+    results.forEach(r => { counts[r._id.toString()] = r.count; });
+    res.json({ success: true, counts });
+  } catch (error) {
+    console.error('Presence batch error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
 app.get('/api/discussions', async (req, res) => {
   try {
     const sort = req.query.sort || 'trending';
@@ -760,6 +835,25 @@ app.get('/api/discussions/:id', async (req, res) => {
       },
     });
   } catch (error) {
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.post('/api/discussions/:id/heartbeat', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    req.user = optionalAuthFromHeader(req);
+    const visitorKey = visitorKeyFromReq(req);
+    await Presence.updateOne(
+      { discussionId: req.params.id, visitorKey },
+      { $set: { lastSeenAt: new Date() } },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Heartbeat error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
@@ -2040,6 +2134,30 @@ app.get('/api/search', async (req, res) => {
     res.status(500).json({ success: false, message: 'خطأ في البحث' });
   }
 });
+app.post('/api/admin/discussions/:id/feature', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const featured = req.body && req.body.featured === true;
+    const update = featured
+      ? { isFeatured: true, featuredAt: new Date() }
+      : { isFeatured: false, featuredAt: null };
+    const discussion = await Discussion.findByIdAndUpdate(req.params.id, update, { new: true }).lean();
+    if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
+    res.json({
+      success: true,
+      discussion: Object.assign({}, discussion, {
+        _id: discussion._id.toString(),
+        isExpired: isDiscussionExpired(discussion)
+      })
+    });
+  } catch (error) {
+    console.error('Feature discussion error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
 // Delete legacy/test circles (admin only)
 app.post('/api/admin/cleanup-circles', authMiddleware, adminMiddleware, async (req, res) => {
   try {
