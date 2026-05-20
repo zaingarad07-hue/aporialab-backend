@@ -296,6 +296,29 @@ const PresenceSchema = new mongoose.Schema({
   lastSeenAt: { type: Date, default: Date.now },
 });
 
+const AUDIO_ROOM_STATUSES = ['scheduled', 'live', 'ended', 'cancelled'];
+
+const AudioRoomSchema = new mongoose.Schema({
+  discussionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Discussion', required: true, index: true },
+  host: {
+    _id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    name: String,
+    avatar: String,
+    isFoundingMember: Boolean,
+  },
+  title: { type: String, required: true, maxlength: 200 },
+  description: { type: String, default: '', maxlength: 2000 },
+  scheduledAt: { type: Date, required: true, index: true },
+  status: { type: String, enum: AUDIO_ROOM_STATUSES, default: 'scheduled', index: true },
+  startedAt: { type: Date, default: null },
+  endedAt: { type: Date, default: null },
+  recordingUrl: { type: String, default: null },
+  livekitRoomName: { type: String, default: null },
+  maxParticipants: { type: Number, default: 50, min: 2, max: 500 },
+  rsvpedUserIds: [{ type: String }],
+  attendeesPeakCount: { type: Number, default: 0 },
+}, { timestamps: true });
+
 DiscussionSchema.index({ createdAt: -1 });
 DiscussionSchema.index({ views: -1, createdAt: -1 });
 DiscussionSchema.index({ category: 1, createdAt: -1 });
@@ -316,12 +339,18 @@ NotificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 
 PresenceSchema.index({ discussionId: 1, visitorKey: 1 }, { unique: true });
 PresenceSchema.index({ lastSeenAt: 1 }, { expireAfterSeconds: 90 });
 
+AudioRoomSchema.index({ scheduledAt: 1, status: 1 });
+AudioRoomSchema.index({ status: 1, scheduledAt: 1 });
+AudioRoomSchema.index({ discussionId: 1, scheduledAt: -1 });
+AudioRoomSchema.index({ 'host._id': 1, scheduledAt: -1 });
+
 const User = mongoose.models.User || mongoose.model('User', UserSchema);
 const Discussion = mongoose.models.Discussion || mongoose.model('Discussion', DiscussionSchema);
 const Comment = mongoose.models.Comment || mongoose.model('Comment', CommentSchema);
 const Circle = mongoose.models.Circle || mongoose.model('Circle', CircleSchema);
 const Notification = mongoose.models.Notification || mongoose.model('Notification', NotificationSchema);
 const Presence = mongoose.models.Presence || mongoose.model('Presence', PresenceSchema);
+const AudioRoom = mongoose.models.AudioRoom || mongoose.model('AudioRoom', AudioRoomSchema);
 
 async function createNotification({ recipient, sender, type, title, message, link, metadata }) {
   if (!recipient) return null;
@@ -2134,6 +2163,187 @@ app.get('/api/search', async (req, res) => {
     res.status(500).json({ success: false, message: 'خطأ في البحث' });
   }
 });
+// ============ Audio Rooms (scheduled discussions) ============
+
+function serializeAudioRoom(room) {
+  if (!room) return null;
+  return Object.assign({}, room, {
+    _id: room._id.toString(),
+    discussionId: room.discussionId ? room.discussionId.toString() : null,
+    host: room.host ? Object.assign({}, room.host, {
+      _id: room.host._id ? room.host._id.toString() : null,
+    }) : null,
+    rsvpCount: Array.isArray(room.rsvpedUserIds) ? room.rsvpedUserIds.length : 0,
+  });
+}
+
+app.post('/api/discussions/:id/rooms', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const discussion = await Discussion.findById(req.params.id).lean();
+    if (!discussion) return res.status(404).json({ success: false, message: 'النقاش غير موجود' });
+
+    if (discussion.author._id.toString() !== req.user.userId) {
+      return res.status(403).json({ success: false, message: 'لا يمكن جدولة غرفة إلا لصاحب النقاش' });
+    }
+
+    const title = sanitizeString(req.body && req.body.title, 200);
+    const description = sanitizeString(req.body && req.body.description, 2000);
+    if (!title || title.length < 3) {
+      return res.status(400).json({ success: false, message: 'العنوان مطلوب (3 أحرف على الأقل)' });
+    }
+
+    const scheduledAtRaw = req.body && req.body.scheduledAt;
+    const scheduledAt = scheduledAtRaw ? new Date(scheduledAtRaw) : null;
+    if (!scheduledAt || isNaN(scheduledAt.getTime())) {
+      return res.status(400).json({ success: false, message: 'موعد الجلسة غير صالح' });
+    }
+    if (scheduledAt.getTime() < Date.now() + 60 * 1000) {
+      return res.status(400).json({ success: false, message: 'يجب جدولة الجلسة بعد دقيقة على الأقل من الآن' });
+    }
+
+    let maxParticipants = parseInt(req.body && req.body.maxParticipants, 10);
+    if (!maxParticipants || isNaN(maxParticipants)) maxParticipants = 50;
+    maxParticipants = Math.min(500, Math.max(2, maxParticipants));
+
+    const user = await User.findById(req.user.userId).select('name avatar isFoundingMember').lean();
+    if (!user) return res.status(404).json({ success: false, message: 'المستخدم غير موجود' });
+
+    const room = await AudioRoom.create({
+      discussionId: discussion._id,
+      host: {
+        _id: user._id,
+        name: user.name,
+        avatar: user.avatar || '',
+        isFoundingMember: !!user.isFoundingMember,
+      },
+      title,
+      description,
+      scheduledAt,
+      maxParticipants,
+      rsvpedUserIds: [req.user.userId],
+    });
+
+    res.status(201).json({ success: true, room: serializeAudioRoom(room.toObject()) });
+  } catch (error) {
+    console.error('Schedule room error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/rooms', async (req, res) => {
+  try {
+    const statusParam = (req.query.status || 'upcoming').toString();
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 20));
+    const query = {};
+    if (statusParam === 'upcoming') {
+      query.status = { $in: ['scheduled', 'live'] };
+    } else if (AUDIO_ROOM_STATUSES.indexOf(statusParam) !== -1) {
+      query.status = statusParam;
+    }
+    const rooms = await AudioRoom.find(query)
+      .sort({ scheduledAt: 1 })
+      .limit(limit)
+      .lean();
+    res.json({ success: true, rooms: rooms.map(serializeAudioRoom) });
+  } catch (error) {
+    console.error('List rooms error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/discussions/:id/rooms', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const rooms = await AudioRoom.find({ discussionId: req.params.id })
+      .sort({ scheduledAt: -1 })
+      .limit(20)
+      .lean();
+    res.json({ success: true, rooms: rooms.map(serializeAudioRoom) });
+  } catch (error) {
+    console.error('Discussion rooms error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.get('/api/rooms/:id', async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const room = await AudioRoom.findById(req.params.id).lean();
+    if (!room) return res.status(404).json({ success: false, message: 'الغرفة غير موجودة' });
+    res.json({ success: true, room: serializeAudioRoom(room) });
+  } catch (error) {
+    console.error('Room read error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.post('/api/rooms/:id/rsvp', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const room = await AudioRoom.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'الغرفة غير موجودة' });
+    if (room.status === 'cancelled' || room.status === 'ended') {
+      return res.status(400).json({ success: false, message: 'لا يمكن التسجيل في غرفة منتهية' });
+    }
+    const uid = req.user.userId;
+    const isRsvped = room.rsvpedUserIds.indexOf(uid) !== -1;
+    if (isRsvped) {
+      room.rsvpedUserIds = room.rsvpedUserIds.filter(id => id !== uid);
+    } else {
+      if (room.rsvpedUserIds.length >= room.maxParticipants) {
+        return res.status(400).json({ success: false, message: 'الغرفة ممتلئة' });
+      }
+      room.rsvpedUserIds.push(uid);
+    }
+    await room.save();
+    res.json({
+      success: true,
+      isRsvped: !isRsvped,
+      room: serializeAudioRoom(room.toObject()),
+    });
+  } catch (error) {
+    console.error('RSVP error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+app.delete('/api/rooms/:id', authMiddleware, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'معرف غير صحيح' });
+    }
+    const room = await AudioRoom.findById(req.params.id);
+    if (!room) return res.status(404).json({ success: false, message: 'الغرفة غير موجودة' });
+
+    const isHost = room.host && room.host._id && room.host._id.toString() === req.user.userId;
+    const requester = await User.findById(req.user.userId).select('role').lean();
+    const isAdmin = requester && requester.role === 'admin';
+    if (!isHost && !isAdmin) {
+      return res.status(403).json({ success: false, message: 'غير مصرح' });
+    }
+
+    if (room.status === 'live' || room.status === 'ended') {
+      return res.status(400).json({ success: false, message: 'لا يمكن إلغاء جلسة بدأت أو انتهت' });
+    }
+
+    room.status = 'cancelled';
+    await room.save();
+    res.json({ success: true, room: serializeAudioRoom(room.toObject()) });
+  } catch (error) {
+    console.error('Cancel room error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
 app.post('/api/admin/discussions/:id/feature', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
