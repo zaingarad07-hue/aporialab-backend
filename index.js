@@ -1716,6 +1716,8 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
       query.type = { $in: ['reaction_logical', 'reaction_inspiring'] };
     } else if (filter === 'circle') {
       query.type = { $in: ['circle_join_request', 'circle_approved', 'circle_rejected'] };
+    } else if (filter === 'room') {
+      query.type = { $in: ['room_scheduled', 'room_starting_soon', 'room_cancelled'] };
     }
 
     const [total, notifications, unreadCount] = await Promise.all([
