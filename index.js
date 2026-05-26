@@ -273,6 +273,9 @@ const NOTIFICATION_TYPES = [
   'circle_join_request',
   'circle_approved',
   'circle_rejected',
+  'room_scheduled',
+  'room_starting_soon',
+  'room_cancelled',
 ];
 
 const NotificationSchema = new mongoose.Schema({
@@ -317,6 +320,7 @@ const AudioRoomSchema = new mongoose.Schema({
   maxParticipants: { type: Number, default: 50, min: 2, max: 500 },
   rsvpedUserIds: [{ type: String }],
   attendeesPeakCount: { type: Number, default: 0 },
+  notifiedStartingSoon: { type: Boolean, default: false },
 }, { timestamps: true });
 
 DiscussionSchema.index({ createdAt: -1 });
@@ -1712,6 +1716,8 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
       query.type = { $in: ['reaction_logical', 'reaction_inspiring'] };
     } else if (filter === 'circle') {
       query.type = { $in: ['circle_join_request', 'circle_approved', 'circle_rejected'] };
+    } else if (filter === 'room') {
+      query.type = { $in: ['room_scheduled', 'room_starting_soon', 'room_cancelled'] };
     }
 
     const [total, notifications, unreadCount] = await Promise.all([
@@ -2226,12 +2232,47 @@ app.post('/api/discussions/:id/rooms', authMiddleware, async (req, res) => {
       rsvpedUserIds: [req.user.userId],
     });
 
+    // Fire-and-forget: notify users who commented on this discussion (max 100 unique).
+    notifyDiscussionCommentersOfRoom(discussion, room, user).catch(err => {
+      console.error('Notify commenters of room error:', err);
+    });
+
     res.status(201).json({ success: true, room: serializeAudioRoom(room.toObject()) });
   } catch (error) {
     console.error('Schedule room error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
+
+async function notifyDiscussionCommentersOfRoom(discussion, room, host) {
+  try {
+    const commenterIds = await Comment.distinct('author._id', { discussionId: discussion._id });
+    const hostIdStr = host._id.toString();
+    const unique = commenterIds
+      .map(id => id && id.toString())
+      .filter(id => id && id !== hostIdStr)
+      .slice(0, 100);
+    if (unique.length === 0) return;
+    const link = '/rooms/' + room._id.toString();
+    const senderInfo = { _id: host._id, name: host.name, avatar: host.avatar || '' };
+    const metadata = {
+      roomId: room._id.toString(),
+      discussionId: discussion._id.toString(),
+      scheduledAt: room.scheduledAt,
+    };
+    await Promise.all(unique.map(recipient => createNotification({
+      recipient,
+      sender: senderInfo,
+      type: 'room_scheduled',
+      title: 'تمت جدولة غرفة صوتيّة على نقاش تابعته',
+      message: room.title,
+      link,
+      metadata,
+    })));
+  } catch (err) {
+    console.error('notifyDiscussionCommentersOfRoom error:', err);
+  }
+}
 
 app.get('/api/rooms', async (req, res) => {
   try {
@@ -2335,11 +2376,115 @@ app.delete('/api/rooms/:id', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, message: 'لا يمكن إلغاء جلسة بدأت أو انتهت' });
     }
 
+    const previousRsvpers = room.rsvpedUserIds.slice();
     room.status = 'cancelled';
     await room.save();
+
+    // Fire-and-forget: notify RSVPers (other than the canceller) that the session was cancelled.
+    notifyRsvpersOfCancellation(room, previousRsvpers, req.user.userId).catch(err => {
+      console.error('Notify cancellation error:', err);
+    });
+
     res.json({ success: true, room: serializeAudioRoom(room.toObject()) });
   } catch (error) {
     console.error('Cancel room error:', error);
+    res.status(500).json({ success: false, message: 'خطأ في الخادم' });
+  }
+});
+
+async function notifyRsvpersOfCancellation(room, rsvpers, cancellerId) {
+  try {
+    const recipients = rsvpers.filter(id => id && id !== cancellerId);
+    if (recipients.length === 0) return;
+    const host = room.host || {};
+    const senderInfo = {
+      _id: host._id,
+      name: host.name || '',
+      avatar: host.avatar || '',
+    };
+    const link = '/rooms/' + room._id.toString();
+    const metadata = {
+      roomId: room._id.toString(),
+      discussionId: room.discussionId ? room.discussionId.toString() : null,
+    };
+    await Promise.all(recipients.map(recipient => createNotification({
+      recipient,
+      sender: senderInfo,
+      type: 'room_cancelled',
+      title: 'تم إلغاء جلسة كنت مسجَّلاً فيها',
+      message: room.title,
+      link,
+      metadata,
+    })));
+  } catch (err) {
+    console.error('notifyRsvpersOfCancellation error:', err);
+  }
+}
+
+app.post('/api/cron/room-reminders', async (req, res) => {
+  try {
+    const cronSecret = process.env.CRON_SECRET;
+    if (!cronSecret) {
+      return res.status(503).json({ success: false, message: 'CRON_SECRET not configured' });
+    }
+    const auth = (req.headers.authorization || '').toString();
+    if (auth !== 'Bearer ' + cronSecret) {
+      return res.status(401).json({ success: false, message: 'unauthorized' });
+    }
+
+    const now = Date.now();
+    const windowStart = new Date(now);
+    const windowEnd = new Date(now + 15 * 60 * 1000);
+
+    const rooms = await AudioRoom.find({
+      status: 'scheduled',
+      notifiedStartingSoon: false,
+      scheduledAt: { $gte: windowStart, $lte: windowEnd },
+    }).limit(50);
+
+    let notifiedRooms = 0;
+    let notifiedUsers = 0;
+
+    for (const room of rooms) {
+      // Atomically claim this room so a concurrent cron run doesn't double-send.
+      const claim = await AudioRoom.updateOne(
+        { _id: room._id, notifiedStartingSoon: false },
+        { $set: { notifiedStartingSoon: true } }
+      );
+      if (claim.modifiedCount !== 1) continue;
+
+      const host = room.host || {};
+      const senderInfo = {
+        _id: host._id,
+        name: host.name || '',
+        avatar: host.avatar || '',
+      };
+      const link = '/rooms/' + room._id.toString();
+      const metadata = {
+        roomId: room._id.toString(),
+        discussionId: room.discussionId ? room.discussionId.toString() : null,
+        scheduledAt: room.scheduledAt,
+      };
+      const recipients = (room.rsvpedUserIds || []).filter(
+        id => id && (!host._id || id !== host._id.toString())
+      );
+      await Promise.all(recipients.map(recipient => createNotification({
+        recipient,
+        sender: senderInfo,
+        type: 'room_starting_soon',
+        title: 'جلسة صوتيّة تبدأ قريباً',
+        message: room.title,
+        link,
+        metadata,
+      })));
+
+      notifiedRooms += 1;
+      notifiedUsers += recipients.length;
+    }
+
+    res.json({ success: true, notifiedRooms, notifiedUsers });
+  } catch (error) {
+    console.error('Cron room-reminders error:', error);
     res.status(500).json({ success: false, message: 'خطأ في الخادم' });
   }
 });
